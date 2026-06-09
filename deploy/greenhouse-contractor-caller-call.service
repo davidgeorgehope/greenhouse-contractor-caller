@@ -1,0 +1,9 @@
+[Unit]
+Description=Greenhouse Contractor Caller outbound run
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/greenhouse-contractor-caller
+EnvironmentFile=/etc/greenhouse-contractor-caller/env
+ExecStart=/opt/greenhouse-contractor-caller/.venv/bin/python -m app.caller
+

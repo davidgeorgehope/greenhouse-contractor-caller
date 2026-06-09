@@ -1,0 +1,931 @@
+from __future__ import annotations
+
+import html
+
+from fastapi import BackgroundTasks, FastAPI, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+from .agent import run_job_agent
+from .auth import authenticate_user, create_session, create_user, delete_session, has_users, require_user
+from .caller import place_calls, place_test_call
+from .config import get_settings
+from .contact import normalize_phone, resolve_lead_for_email, resolve_lead_for_phone
+from .db import (
+    append_event,
+    call_for_id,
+    calls_for_job,
+    create_call,
+    create_email_message,
+    create_job,
+    create_outreach_action,
+    create_sms_message,
+    delete_test_calls_for_job,
+    default_job_brief,
+    job_for_id,
+    leads_for_job,
+    list_jobs,
+    lead_for_call,
+    emails_for_job,
+    mark_lead_status,
+    mark_job_lead_status,
+    sms_for_job,
+    update_call,
+    update_job_brief,
+    update_job_status,
+    upsert_lead,
+    outreach_for_job,
+)
+from .discovery import discover_leads_for_job
+from .outreach import execute_outreach_actions
+from .voice import bridge_call
+
+app = FastAPI(title="Sam Contractor Desk")
+
+
+@app.get("/greenhouse/health")
+def health() -> dict[str, str]:
+    return {"ok": "true"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def root() -> RedirectResponse:
+    return RedirectResponse("/contractor", status_code=303)
+
+
+def _secure_cookie(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    host = (request.url.hostname or "").lower()
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    return request.url.scheme == "https" or forwarded_proto == "https" or host not in local_hosts
+
+
+def _auth_page(title: str, body: str, error: str = "") -> str:
+    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)} · Sam Contractor Desk</title>
+  <style>
+    :root {{ --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); padding:24px; }}
+    main {{ width:min(420px,100%); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:22px; }}
+    h1 {{ margin:0 0 8px; font-size:24px; }}
+    p {{ color:var(--muted); margin:0 0 16px; }}
+    form {{ display:grid; gap:10px; }}
+    input {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:10px; font:inherit; }}
+    button {{ border:0; border-radius:6px; padding:10px 12px; font-weight:700; background:var(--accent); color:white; cursor:pointer; }}
+    a {{ color:var(--accent); font-weight:650; }}
+    .error {{ color:#b42318; background:#fff1f0; border:1px solid #ffd0cc; border-radius:6px; padding:9px; }}
+  </style>
+</head>
+<body><main><h1>{html.escape(title)}</h1>{error_html}{body}</main></body>
+</html>
+"""
+
+
+@app.get("/contractor/login", response_class=HTMLResponse)
+def login_form(request: Request) -> str:
+    if not has_users():
+        return RedirectResponse("/contractor/register", status_code=303)
+    body = """
+    <p>Sign in to manage contractor jobs and outreach.</p>
+    <form method="post" action="/contractor/login">
+      <input name="email" type="email" placeholder="Email" autocomplete="email" required>
+      <input name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+    </form>
+    """
+    return _auth_page("Sign in", body)
+
+
+@app.post("/contractor/login", response_class=HTMLResponse)
+def login(request: Request, email: str = Form(...), password: str = Form(...)) -> Response:
+    user = authenticate_user(email, password)
+    if user is None:
+        body = """
+        <p>Sign in to manage contractor jobs and outreach.</p>
+        <form method="post" action="/contractor/login">
+          <input name="email" type="email" placeholder="Email" autocomplete="email" required>
+          <input name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+          <button type="submit">Sign in</button>
+        </form>
+        """
+        return HTMLResponse(_auth_page("Sign in", body, "Email or password was wrong."), status_code=401)
+    token, expires_at = create_session(int(user["id"]))
+    response = RedirectResponse("/contractor", status_code=303)
+    response.set_cookie(
+        get_settings().contractor_session_cookie,
+        token,
+        httponly=True,
+        secure=_secure_cookie(request),
+        samesite="lax",
+        expires=expires_at,
+    )
+    return response
+
+
+@app.get("/contractor/register", response_class=HTMLResponse)
+def register_form() -> str:
+    settings = get_settings()
+    if not settings.contractor_invite_code:
+        return _auth_page("Registration disabled", "<p>Set CONTRACTOR_INVITE_CODE on the server before creating an account.</p>")
+    body = """
+    <p>Create the first dashboard account with the invite code.</p>
+    <form method="post" action="/contractor/register">
+      <input name="display_name" placeholder="Name" autocomplete="name" required>
+      <input name="email" type="email" placeholder="Email" autocomplete="email" required>
+      <input name="password" type="password" placeholder="Password" autocomplete="new-password" minlength="12" required>
+      <input name="invite_code" type="password" placeholder="Invite code" autocomplete="off" required>
+      <button type="submit">Create account</button>
+    </form>
+    <p><a href="/contractor/login">Already registered?</a></p>
+    """
+    return _auth_page("Register", body)
+
+
+@app.post("/contractor/register", response_class=HTMLResponse)
+def register(
+    request: Request,
+    display_name: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...),
+    invite_code: str = Form(...),
+) -> Response:
+    settings = get_settings()
+    if not settings.contractor_invite_code or not secrets_compare(invite_code, settings.contractor_invite_code):
+        return HTMLResponse(_auth_page("Register", _register_form_body(), "Invite code was wrong."), status_code=403)
+    if len(password) < 12:
+        return HTMLResponse(_auth_page("Register", _register_form_body(), "Password must be at least 12 characters."), status_code=400)
+    try:
+        user_id = create_user(email=email, password=password, display_name=display_name)
+    except Exception:
+        return HTMLResponse(_auth_page("Register", _register_form_body(), "That email is already registered."), status_code=409)
+    token, expires_at = create_session(user_id)
+    response = RedirectResponse("/contractor", status_code=303)
+    response.set_cookie(
+        settings.contractor_session_cookie,
+        token,
+        httponly=True,
+        secure=_secure_cookie(request),
+        samesite="lax",
+        expires=expires_at,
+    )
+    return response
+
+
+def _register_form_body() -> str:
+    return """
+    <p>Create the first dashboard account with the invite code.</p>
+    <form method="post" action="/contractor/register">
+      <input name="display_name" placeholder="Name" autocomplete="name" required>
+      <input name="email" type="email" placeholder="Email" autocomplete="email" required>
+      <input name="password" type="password" placeholder="Password" autocomplete="new-password" minlength="12" required>
+      <input name="invite_code" type="password" placeholder="Invite code" autocomplete="off" required>
+      <button type="submit">Create account</button>
+    </form>
+    <p><a href="/contractor/login">Already registered?</a></p>
+    """
+
+
+def secrets_compare(left: str, right: str) -> bool:
+    import hmac
+
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+@app.post("/contractor/logout")
+def logout(request: Request) -> RedirectResponse:
+    delete_session(request.cookies.get(get_settings().contractor_session_cookie))
+    response = RedirectResponse("/contractor/login", status_code=303)
+    response.delete_cookie(get_settings().contractor_session_cookie)
+    return response
+
+
+@app.get("/contractor", response_class=HTMLResponse)
+def contractor_dashboard(
+    request: Request,
+    job_id: int | None = None,
+    agent: str = "",
+    test_call: str = "",
+    test_cleanup: str = "",
+    outreach_sent: str = "",
+    outreach_blocked: str = "",
+    outreach_failed: str = "",
+) -> str:
+    user = require_user(request)
+    jobs = list_jobs()
+    selected_job = job_for_id(job_id) if job_id else (jobs[0] if jobs else None)
+    selected_job_id = int(selected_job["id"]) if selected_job else None
+    leads = leads_for_job(selected_job_id) if selected_job_id else []
+    calls = calls_for_job(selected_job_id) if selected_job_id else []
+    actions = outreach_for_job(selected_job_id) if selected_job_id else []
+    texts = sms_for_job(selected_job_id) if selected_job_id else []
+    emails = emails_for_job(selected_job_id) if selected_job_id else []
+    settings = get_settings()
+
+    def esc(value: object) -> str:
+        return html.escape("" if value is None else str(value))
+
+    job_tabs = "".join(
+        f"""<a class="job-tab {'active' if selected_job_id == int(job['id']) else ''}" href="/contractor?job_id={job['id']}">
+          <strong>{esc(job['title'])}</strong>
+          <span>{esc(job['status'])} · {job['lead_count']} leads</span>
+        </a>"""
+        for job in jobs
+    )
+    lead_rows = "".join(
+        f"""<tr>
+          <td><strong>{esc(lead['name'])}</strong><span>{esc(lead['category'])}</span></td>
+          <td>{esc(lead['phone'])}</td>
+          <td>{esc(lead['email'])}</td>
+          <td>{esc(lead['status'])}</td>
+          <td>{esc(lead['priority'])}</td>
+          <td>{esc(lead['latest_call_summary'] or lead['notes'])}</td>
+        </tr>"""
+        for lead in leads
+    ) or """<tr><td colspan="6" class="empty">No contractors found yet. Hand the brief to Sam and discovered contractors will appear here.</td></tr>"""
+    call_rows = "".join(
+        f"""<tr>
+          <td>{esc(call['created_at'])}</td>
+          <td>{esc(call['lead_name'])}</td>
+          <td>{esc(call['direction'])}</td>
+          <td>{esc(call['status'])}</td>
+          <td>{esc(call['outcome'] or '')}</td>
+          <td>{esc(call['summary'] or '')}</td>
+          <td><a class="button-link" href="/contractor/calls/{call['id']}">Transcript</a></td>
+        </tr>"""
+        for call in calls
+    ) or """<tr><td colspan="7" class="empty">No calls recorded for this job yet.</td></tr>"""
+    action_rows = "".join(
+        f"""<tr>
+          <td>{esc(action['channel'])}</td>
+          <td>{esc(action['lead_email'] if action['channel'] == 'email' and action['lead_email'] else action['lead_phone'] if action['channel'] == 'text' and action['lead_phone'] else action['lead_name'] or 'Job')}</td>
+          <td>{esc(action['status'])}</td>
+          <td>{esc(action['due_at'] or '')}</td>
+          <td>{esc(action['body'] or action['notes'])}</td>
+        </tr>"""
+        for action in actions
+    ) or """<tr><td colspan="5" class="empty">No next actions yet. Sam will add these when a call, text, or reply needs your attention.</td></tr>"""
+    text_rows = "".join(
+        f"""<tr>
+          <td>{esc(text['created_at'])}</td>
+          <td>{esc(text['lead_name'] or text['from_number'])}</td>
+          <td>{esc(text['direction'])}</td>
+          <td>{esc(text['from_number'])}</td>
+          <td>{esc(text['to_number'])}</td>
+          <td>{esc(text['status'] or '')}</td>
+          <td>{esc(text['body'])}</td>
+        </tr>"""
+        for text in texts
+    ) or """<tr><td colspan="7" class="empty">No texts recorded for this job yet.</td></tr>"""
+    email_rows = "".join(
+        f"""<tr>
+          <td>{esc(email['created_at'])}</td>
+          <td>{esc(email['lead_name'] or email['from_email'])}</td>
+          <td>{esc(email['direction'])}</td>
+          <td>{esc(email['from_email'])}</td>
+          <td>{esc(email['to_email'])}</td>
+          <td>{esc(email['subject'])}</td>
+          <td>{esc(email['body'])}</td>
+        </tr>"""
+        for email in emails
+    ) or """<tr><td colspan="7" class="empty">No emails recorded for this job yet.</td></tr>"""
+    brief_panel = ""
+    if selected_job:
+        if selected_job["status"] == "planning":
+            brief_panel = f"""
+        <section class="panel brief">
+          <div class="section-head">
+            <h2>Brief</h2>
+            <span>Editable while this job is in planning.</span>
+          </div>
+          <form method="post" action="/contractor/jobs/{selected_job_id}/brief">
+            <div class="brief-fields">
+              <label>Title<input name="title" value="{esc(selected_job['title'])}" required></label>
+              <label>Location<input name="location" value="{esc(selected_job['location'])}" required></label>
+            </div>
+            <label>Description<textarea name="description" class="description-editor" required>{esc(selected_job['description'])}</textarea></label>
+            <textarea name="brief" class="brief-editor" required>{esc(selected_job['brief'])}</textarea>
+            <button type="submit">Save brief</button>
+          </form>
+        </section>
+            """
+        else:
+            brief_panel = f"""
+        <section class="panel brief">
+          <div class="section-head">
+            <h2>Brief</h2>
+            <span>Move the job back to planning to edit.</span>
+          </div>
+          <pre>{esc(selected_job['brief'])}</pre>
+        </section>
+            """
+    selected_header = (
+        f"""
+        <section class="panel hero-panel">
+          <div>
+            <p class="eyebrow">Selected job</p>
+            <h1>{esc(selected_job['title'])}</h1>
+            <p>{esc(selected_job['description'])}</p>
+          </div>
+          <form method="post" action="/contractor/jobs/{selected_job_id}/status" class="status-form">
+            <select name="status">
+              {''.join(f'<option value="{status}" {"selected" if selected_job["status"] == status else ""}>{status}</option>' for status in ["planning", "active", "paused", "done"])}
+            </select>
+            <button type="submit">Update</button>
+          </form>
+        </section>
+        {brief_panel}
+        """
+        if selected_job
+        else """<section class="panel hero-panel"><h1>No jobs yet</h1><p>Create the first contractor job to start planning outreach.</p></section>"""
+    )
+    agent_notice = ""
+    if agent == "started":
+        agent_notice = """<p class="notice">Sam is working this brief now. Refresh for new leads, calls, texts, and transcripts.</p>"""
+    if test_call == "started":
+        agent_notice += """<p class="notice">Test call started. It will appear in call history once Twilio reports back.</p>"""
+    if test_cleanup:
+        agent_notice += f"""<p class="notice">Cleaned out {esc(test_cleanup)} test call{'s' if test_cleanup != '1' else ''} for this job.</p>"""
+    if outreach_sent or outreach_blocked or outreach_failed:
+        agent_notice += f"""<p class="notice">Follow-ups processed: {esc(outreach_sent or 0)} sent, {esc(outreach_blocked or 0)} blocked, {esc(outreach_failed or 0)} failed.</p>"""
+    agent_panel = (
+        f"""
+        <section class="panel agent-panel">
+          <div>
+            <p class="eyebrow">Main workflow</p>
+            <h2>Hand the brief to Sam</h2>
+            <p>Fill in the brief, then let Sam source contractors, pick usable candidates, run outreach, and log what happened.</p>
+          </div>
+          {agent_notice}
+          <div class="agent-actions">
+            <form method="post" action="/contractor/jobs/{selected_job_id}/agent">
+              <button type="submit">Hand to Sam</button>
+            </form>
+            <form method="post" action="/contractor/jobs/{selected_job_id}/test-call">
+              <button type="submit" class="secondary">Test call David</button>
+            </form>
+            <form method="post" action="/contractor/jobs/{selected_job_id}/test-calls/cleanup" onsubmit="return confirm('Clean out test calls and transcripts for this job? Real contractor calls will stay.');">
+              <button type="submit" class="secondary">Clean test calls</button>
+            </form>
+          </div>
+          {'<p class="warning">Caller is disabled on this server, so the agent can source leads but cannot place calls until CALLER_DISABLED=0.</p>' if settings.caller_disabled else ''}
+        </section>
+        """
+        if selected_job_id
+        else ""
+    )
+    followup_button = (
+        f"""
+          <form method="post" action="/contractor/jobs/{selected_job_id}/followups/execute" onsubmit="return confirm('Send due draft/queued text and email follow-ups for this job?');">
+            <button type="submit" class="secondary">Send due follow-ups</button>
+          </form>
+        """
+        if selected_job_id
+        else ""
+    )
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sam Contractor Desk</title>
+  <style>
+    :root {{ color-scheme: light; --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; --accent-2:#a16207; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }}
+    header {{ display:flex; justify-content:space-between; align-items:center; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:#fbfcfa; position:sticky; top:0; z-index:1; }}
+    header h1 {{ margin:0; font-size:20px; }}
+    header span {{ color:var(--muted); }}
+    main {{ display:grid; grid-template-columns:280px 1fr; gap:18px; padding:18px; max-width:1440px; margin:0 auto; }}
+    aside, .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; }}
+    aside {{ padding:12px; height:calc(100vh - 92px); position:sticky; top:74px; overflow:auto; }}
+    .job-tab {{ display:block; color:inherit; text-decoration:none; padding:10px; border-radius:6px; border:1px solid transparent; }}
+    .job-tab.active {{ border-color:var(--accent); background:#e7f4f1; }}
+    .job-tab span, td span {{ display:block; color:var(--muted); font-size:12px; margin-top:2px; }}
+    .stack {{ display:grid; gap:18px; min-width:0; }}
+    .panel {{ padding:16px; overflow:hidden; }}
+    .hero-panel {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-start; }}
+    .agent-panel {{ display:grid; grid-template-columns:1fr auto; gap:14px 18px; align-items:center; border-color:#8bbab2; background:#f7fbfa; }}
+    .agent-actions {{ display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; align-items:center; }}
+    .agent-actions form {{ display:block; }}
+    .execute-panel {{ display:flex; justify-content:space-between; align-items:center; gap:18px; }}
+    .source-form {{ grid-template-columns:1fr auto; }}
+    .execute-panel p {{ margin:0; color:var(--muted); }}
+    .agent-panel p {{ margin:0; color:var(--muted); max-width:840px; }}
+    .agent-panel h2 {{ margin:2px 0 6px; font-size:22px; }}
+    .hero-panel h1 {{ margin:2px 0 6px; font-size:28px; line-height:1.1; }}
+    .hero-panel p {{ margin:0; color:var(--muted); max-width:820px; }}
+    .eyebrow {{ text-transform:uppercase; letter-spacing:.08em; font-size:11px; color:var(--accent-2) !important; font-weight:700; }}
+    h2 {{ margin:0 0 10px; font-size:16px; }}
+    .section-head {{ display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:10px; }}
+    .section-head h2 {{ margin:0; }}
+    .section-head span {{ color:var(--muted); font-size:12px; }}
+    table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
+    th, td {{ border-top:1px solid var(--line); padding:9px 8px; text-align:left; vertical-align:top; overflow-wrap:anywhere; }}
+    th {{ color:var(--muted); font-size:12px; font-weight:650; }}
+    pre {{ margin:0; white-space:pre-wrap; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; color:#233128; }}
+    form {{ display:grid; gap:8px; }}
+    .grid-form {{ grid-template-columns:repeat(5,minmax(0,1fr)); align-items:start; }}
+    .grid-form textarea {{ grid-column:span 5; min-height:72px; }}
+    input, textarea, select {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; background:#fff; color:var(--ink); }}
+    .brief-editor {{ min-height:360px; resize:vertical; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }}
+    .description-editor {{ min-height:88px; resize:vertical; }}
+    label {{ display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:650; }}
+    .brief-fields {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }}
+    button {{ border:0; border-radius:6px; padding:9px 12px; font-weight:700; background:var(--accent); color:white; cursor:pointer; }}
+    button.secondary {{ background:#69756c; }}
+    td form {{ display:inline-grid; margin:0 4px 4px 0; }}
+    .button-link {{ display:inline-flex; align-items:center; justify-content:center; min-height:32px; padding:7px 10px; border-radius:6px; background:#e7f4f1; color:var(--accent); font-weight:700; text-decoration:none; }}
+    .button-link.wide {{ width:100%; }}
+    .status-form {{ min-width:180px; grid-template-columns:1fr auto; }}
+    .empty {{ color:var(--muted); }}
+    .warning {{ margin:0; color:#9a3412; font-size:12px; }}
+    .notice {{ margin:0 0 10px; color:#166534; background:#edf9ef; border:1px solid #c8e6ca; border-radius:6px; padding:9px; }}
+    .agent-panel .notice, .agent-panel .warning {{ grid-column:1 / -1; }}
+    button:disabled {{ background:#aab5ad; cursor:not-allowed; }}
+    @media (max-width: 900px) {{ main {{ grid-template-columns:1fr; }} aside {{ position:static; height:auto; }} .hero-panel, .execute-panel {{ display:grid; }} .grid-form, .brief-fields {{ grid-template-columns:1fr; }} .grid-form textarea {{ grid-column:auto; }} }}
+  </style>
+</head>
+<body>
+  <header><div><h1>Sam Contractor Desk</h1><span>Write the brief. Hand it to Sam. Review what happened.</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
+  <main>
+    <aside>
+      <h2>Jobs</h2>
+      {job_tabs or '<p class="empty">No jobs yet.</p>'}
+      <hr>
+      <a class="button-link wide" href="/contractor/jobs/new">Create job</a>
+    </aside>
+    <div class="stack">
+      {selected_header}
+      {agent_panel}
+      <section class="panel"><h2>Contractors found</h2><table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Status</th><th>Priority</th><th>Notes / latest result</th></tr></thead><tbody>{lead_rows}</tbody></table></section>
+      <section class="panel"><h2>Call history</h2><table><thead><tr><th>When</th><th>Lead</th><th>Direction</th><th>Status</th><th>Outcome</th><th>Summary</th><th>Review</th></tr></thead><tbody>{call_rows}</tbody></table></section>
+      <section class="panel"><h2>Texts</h2><table><thead><tr><th>When</th><th>Lead</th><th>Direction</th><th>From</th><th>To</th><th>Status</th><th>Body</th></tr></thead><tbody>{text_rows}</tbody></table></section>
+      <section class="panel"><h2>Emails</h2><table><thead><tr><th>When</th><th>Lead</th><th>Direction</th><th>From</th><th>To</th><th>Subject</th><th>Body</th></tr></thead><tbody>{email_rows}</tbody></table></section>
+      <section class="panel">
+        <div class="section-head">
+          <h2>Next actions</h2>
+          {followup_button}
+        </div>
+        <table><thead><tr><th>Channel</th><th>Target</th><th>Status</th><th>Due</th><th>Body / notes</th></tr></thead><tbody>{action_rows}</tbody></table>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
+"""
+
+
+@app.get("/contractor/calls/{call_id}", response_class=HTMLResponse)
+def call_detail(request: Request, call_id: int) -> str:
+    user = require_user(request)
+    call = call_for_id(call_id)
+
+    def esc(value: object) -> str:
+        return html.escape("" if value is None else str(value))
+
+    if call is None:
+        return HTMLResponse(_auth_page("Call not found", '<p><a href="/contractor">Back to dashboard</a></p>'), status_code=404)
+
+    job_id = int(call["job_id"]) if call["job_id"] is not None else None
+    back_href = f"/contractor?job_id={job_id}" if job_id else "/contractor"
+    transcript = call["transcript"] or "No transcript was captured for this call."
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Call Transcript · Sam Contractor Desk</title>
+  <style>
+    :root {{ color-scheme: light; --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; --accent-2:#a16207; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }}
+    header {{ display:flex; justify-content:space-between; align-items:center; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:#fbfcfa; position:sticky; top:0; z-index:1; }}
+    header h1 {{ margin:0; font-size:20px; }}
+    header span, .meta {{ color:var(--muted); }}
+    main {{ max-width:1040px; margin:0 auto; padding:18px; display:grid; gap:18px; }}
+    .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; overflow:hidden; }}
+    h2 {{ margin:0 0 10px; font-size:16px; }}
+    dl {{ display:grid; grid-template-columns:140px 1fr; gap:8px 14px; margin:0; }}
+    dt {{ color:var(--muted); font-weight:700; }}
+    dd {{ margin:0; overflow-wrap:anywhere; }}
+    pre {{ margin:0; white-space:pre-wrap; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:#233128; }}
+    a, .button-link {{ color:var(--accent); font-weight:700; }}
+    .button-link {{ display:inline-flex; align-items:center; justify-content:center; min-height:34px; padding:8px 11px; border-radius:6px; background:#e7f4f1; text-decoration:none; }}
+    form {{ display:grid; gap:8px; }}
+    button {{ border:0; border-radius:6px; padding:9px 12px; font-weight:700; background:var(--accent); color:white; cursor:pointer; }}
+    @media (max-width:700px) {{ dl {{ grid-template-columns:1fr; }} }}
+  </style>
+</head>
+<body>
+  <header><div><h1>Sam Contractor Desk</h1><span>Call transcript review</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
+  <main>
+    <a class="button-link" href="{back_href}">Back to dashboard</a>
+    <section class="panel">
+      <h2>{esc(call['lead_name'])}</h2>
+      <dl>
+        <dt>Job</dt><dd>{esc(call['job_title'] or '')}</dd>
+        <dt>Phone</dt><dd>{esc(call['lead_phone'])}</dd>
+        <dt>Created</dt><dd>{esc(call['created_at'])}</dd>
+        <dt>Status</dt><dd>{esc(call['status'])}</dd>
+        <dt>Outcome</dt><dd>{esc(call['outcome'] or '')}</dd>
+        <dt>Twilio SID</dt><dd>{esc(call['twilio_sid'] or '')}</dd>
+        <dt>Summary</dt><dd>{esc(call['summary'] or '')}</dd>
+      </dl>
+    </section>
+    <section class="panel">
+      <h2>Transcript</h2>
+      <pre>{esc(transcript)}</pre>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+@app.get("/contractor/jobs/new", response_class=HTMLResponse)
+def new_contractor_job(request: Request) -> str:
+    user = require_user(request)
+    settings = get_settings()
+
+    def esc(value: object) -> str:
+        return html.escape("" if value is None else str(value))
+
+    starter_brief = default_job_brief(
+        "New contractor job",
+        "Describe the work, materials already owned, constraints, photos or measurements needed, and what counts as a good contractor.",
+        settings.project_address,
+    )
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Create Job · Sam Contractor Desk</title>
+  <style>
+    :root {{ color-scheme: light; --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; --accent-2:#a16207; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }}
+    header {{ display:flex; justify-content:space-between; align-items:center; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:#fbfcfa; position:sticky; top:0; z-index:1; }}
+    header h1 {{ margin:0; font-size:20px; }}
+    header span {{ color:var(--muted); }}
+    main {{ max-width:1120px; margin:0 auto; padding:18px; display:grid; gap:18px; }}
+    .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; overflow:hidden; }}
+    .hero-panel {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-start; }}
+    .hero-panel h1 {{ margin:2px 0 6px; font-size:28px; line-height:1.1; }}
+    .hero-panel p {{ margin:0; color:var(--muted); max-width:760px; }}
+    .eyebrow {{ text-transform:uppercase; letter-spacing:.08em; font-size:11px; color:var(--accent-2); font-weight:700; margin:0; }}
+    form {{ display:grid; gap:10px; }}
+    .brief-fields {{ display:grid; grid-template-columns:1fr 220px 1fr; gap:10px; }}
+    label {{ display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:650; }}
+    input, textarea {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; background:#fff; color:var(--ink); }}
+    .description-editor {{ min-height:92px; resize:vertical; }}
+    .brief-editor {{ min-height:460px; resize:vertical; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }}
+    .form-actions {{ display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; }}
+    button, .button-link {{ border:0; border-radius:6px; padding:9px 12px; font-weight:700; background:var(--accent); color:white; cursor:pointer; text-decoration:none; }}
+    .button-link.secondary {{ background:#e7f4f1; color:var(--accent); }}
+    @media (max-width:800px) {{ .brief-fields, .hero-panel {{ display:grid; grid-template-columns:1fr; }} }}
+  </style>
+</head>
+<body>
+  <header><div><h1>Sam Contractor Desk</h1><span>Create a contractor job brief</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
+  <main>
+    <section class="panel hero-panel">
+      <div>
+        <p class="eyebrow">New job</p>
+        <h1>Create the brief</h1>
+        <p>This is the source of truth Sam will use for search, calls, texts, emails, and follow-ups.</p>
+      </div>
+      <a class="button-link secondary" href="/contractor">Back</a>
+    </section>
+    <section class="panel">
+      <form method="post" action="/contractor/jobs">
+        <div class="brief-fields">
+          <label>Title<input name="title" placeholder="Interior door fitting" required></label>
+          <label>Type<input name="job_type" placeholder="door_installation" value="general"></label>
+          <label>Location<input name="location" value="{esc(settings.project_address)}" required></label>
+        </div>
+        <label>Description<textarea name="description" class="description-editor" placeholder="Short plain-English job summary" required></textarea></label>
+        <label>Full brief<textarea name="brief" class="brief-editor" required>{esc(starter_brief)}</textarea></label>
+        <div class="form-actions">
+          <a class="button-link secondary" href="/contractor">Cancel</a>
+          <button type="submit">Create job</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+@app.post("/contractor/jobs")
+def create_contractor_job(
+    request: Request,
+    title: str = Form(...),
+    job_type: str = Form("general"),
+    description: str = Form(...),
+    location: str = Form(""),
+    brief: str = Form(""),
+) -> RedirectResponse:
+    require_user(request)
+    job_id = create_job(title=title, job_type=job_type, description=description, location=location)
+    if brief.strip():
+        update_job_brief(job_id, brief, title=title, description=description, location=location)
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/status")
+def set_contractor_job_status(request: Request, job_id: int, status: str = Form(...)) -> RedirectResponse:
+    require_user(request)
+    update_job_status(job_id, status)
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/brief")
+def set_contractor_job_brief(
+    request: Request,
+    job_id: int,
+    title: str = Form(...),
+    description: str = Form(...),
+    location: str = Form(...),
+    brief: str = Form(...),
+) -> RedirectResponse:
+    require_user(request)
+    update_job_brief(job_id, brief, title=title, description=description, location=location)
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/leads")
+def add_contractor_lead(
+    request: Request,
+    job_id: int,
+    name: str = Form(...),
+    phone: str = Form(...),
+    email: str = Form(""),
+    category: str = Form("contractor"),
+    source_url: str = Form(""),
+    notes: str = Form(""),
+    priority: int = Form(50),
+) -> RedirectResponse:
+    require_user(request)
+    upsert_lead(
+        job_id=job_id,
+        name=name,
+        phone=phone,
+        email=email,
+        category=category,
+        source_url=source_url,
+        notes=notes,
+        priority=priority,
+        status="pending",
+    )
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/discover")
+def discover_contractor_leads(
+    request: Request,
+    job_id: int,
+    query: str = Form(""),
+) -> RedirectResponse:
+    require_user(request)
+    result = discover_leads_for_job(job_id, query=query)
+    return RedirectResponse(
+        f"/contractor?job_id={job_id}&discovered={int(result['created'])}&searched={int(result['searched'])}",
+        status_code=303,
+    )
+
+
+@app.post("/contractor/jobs/{job_id}/leads/{lead_id}/approve")
+def approve_contractor_lead(request: Request, job_id: int, lead_id: int) -> RedirectResponse:
+    require_user(request)
+    mark_job_lead_status(job_id, lead_id, "pending")
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/leads/{lead_id}/skip")
+def skip_contractor_lead(request: Request, job_id: int, lead_id: int) -> RedirectResponse:
+    require_user(request)
+    mark_job_lead_status(job_id, lead_id, "skipped")
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/followups")
+def add_contractor_followup(
+    request: Request,
+    job_id: int,
+    channel: str = Form("text"),
+    body: str = Form(""),
+    due_at: str = Form(""),
+) -> RedirectResponse:
+    require_user(request)
+    create_outreach_action(job_id=job_id, lead_id=None, channel=channel, body=body, due_at=due_at or None)
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/followups/execute")
+def execute_contractor_followups(request: Request, job_id: int) -> RedirectResponse:
+    require_user(request)
+    result = execute_outreach_actions(job_id)
+    return RedirectResponse(
+        f"/contractor?job_id={job_id}"
+        f"&outreach_sent={result['sent']}"
+        f"&outreach_blocked={result['blocked']}"
+        f"&outreach_failed={result['failed']}",
+        status_code=303,
+    )
+
+
+@app.post("/contractor/jobs/{job_id}/call-loop")
+def run_call_loop(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
+    require_user(request)
+    background_tasks.add_task(place_calls, job_id=job_id, include_unknown_travel=True)
+    return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/test-call")
+def run_test_call(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
+    require_user(request)
+    background_tasks.add_task(place_test_call, job_id=job_id, to_number=get_settings().owner_phone)
+    return RedirectResponse(f"/contractor?job_id={job_id}&test_call=started", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/test-calls/cleanup")
+def cleanup_test_calls(request: Request, job_id: int) -> RedirectResponse:
+    require_user(request)
+    deleted = delete_test_calls_for_job(job_id)
+    return RedirectResponse(f"/contractor?job_id={job_id}&test_cleanup={deleted}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/agent")
+def hand_job_to_agent(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
+    require_user(request)
+    background_tasks.add_task(run_job_agent, job_id)
+    return RedirectResponse(f"/contractor?job_id={job_id}&agent=started", status_code=303)
+
+
+@app.post("/greenhouse/incoming")
+async def incoming(request: Request) -> Response:
+    form = await request.form()
+    payload = dict(form)
+    from_number = normalize_phone(str(payload.get("From", "")))
+    lead = resolve_lead_for_phone(from_number, fallback_name=from_number or "Inbound caller")
+    if lead is None:
+        append_event(None, "incoming_call_unmatched", payload)
+        body = """
+<Response>
+  <Say voice="alice">Hi, this is the customer's assistant. I could not find the current job context, so please text this number with your name, availability, and what you are calling about. Thank you.</Say>
+</Response>
+""".strip()
+        return Response(body, media_type="application/xml")
+
+    call_id = create_call(int(lead["id"]), direction="inbound")
+    append_event(call_id, "incoming_call", payload)
+    call_sid = str(payload.get("CallSid", ""))
+    if call_sid:
+        update_call(call_id, twilio_sid=call_sid, status="answered")
+
+    settings = get_settings()
+    host = settings.app_host.replace("https://", "").replace("http://", "")
+    lead_name = html.escape(str(lead["name"]))
+    body = f"""
+<Response>
+  <Connect>
+    <Stream url="wss://{host}/greenhouse/stream/{call_id}">
+      <Parameter name="lead_name" value="{lead_name}" />
+      <Parameter name="direction" value="inbound" />
+    </Stream>
+  </Connect>
+</Response>
+""".strip()
+    return Response(body, media_type="application/xml")
+
+
+@app.post("/greenhouse/sms")
+async def sms(request: Request) -> Response:
+    form = await request.form()
+    payload = dict(form)
+    from_number = normalize_phone(str(payload.get("From", "")))
+    to_number = normalize_phone(str(payload.get("To", "")))
+    lead = resolve_lead_for_phone(from_number, fallback_name=from_number or "Inbound text")
+    create_sms_message(
+        direction="inbound",
+        from_number=from_number,
+        to_number=to_number,
+        body=str(payload.get("Body", "")),
+        twilio_sid=str(payload.get("MessageSid", "")) or None,
+        status=str(payload.get("SmsStatus", "")) or None,
+        raw_payload=payload,
+    )
+    if lead is not None and lead["job_id"] is not None:
+        create_outreach_action(
+            job_id=int(lead["job_id"]),
+            lead_id=int(lead["id"]),
+            channel="text",
+            direction="inbound",
+            status="received",
+            body=str(payload.get("Body", "")),
+            notes="Inbound contractor text received.",
+        )
+    append_event(None, "incoming_sms", payload)
+    return Response("<Response></Response>", media_type="application/xml")
+
+
+@app.post("/greenhouse/email")
+async def inbound_email(request: Request):
+    settings = get_settings()
+    expected = settings.contractor_email_ingest_secret
+    authorization = request.headers.get("authorization", "")
+    if not expected or authorization != f"Bearer {expected}":
+        return Response("unauthorized", status_code=401)
+
+    payload = await request.json()
+    from_email = str(payload.get("from", "")).strip().lower()
+    to_email = str(payload.get("to", "")).strip().lower()
+    lead = resolve_lead_for_email(from_email, fallback_name=from_email or "Inbound email")
+    create_email_message(
+        direction="inbound",
+        from_email=from_email,
+        to_email=to_email,
+        subject=str(payload.get("subject", "")),
+        body=str(payload.get("text", "")),
+        message_id=str(payload.get("message_id", "")) or None,
+        status="received",
+        raw_payload=payload,
+    )
+    if lead is not None and lead["job_id"] is not None:
+        create_outreach_action(
+            job_id=int(lead["job_id"]),
+            lead_id=int(lead["id"]),
+            channel="email",
+            direction="inbound",
+            status="received",
+            body=str(payload.get("text", "")),
+            notes=f"Inbound contractor email received: {payload.get('subject', '')}",
+        )
+    append_event(None, "incoming_email", payload)
+    return {"ok": "true"}
+
+
+@app.post("/greenhouse/twiml/{call_id}")
+async def twiml(call_id: int, request: Request) -> Response:
+    lead = lead_for_call(call_id)
+    if lead is None:
+        return Response("<Response><Say>Call configuration not found.</Say></Response>", media_type="application/xml")
+
+    form = await request.form()
+    append_event(call_id, "twiml", dict(form))
+    call_sid = str(form.get("CallSid", ""))
+    if call_sid:
+        update_call(call_id, twilio_sid=call_sid, status="answered")
+
+    settings = get_settings()
+    host = settings.app_host.replace("https://", "").replace("http://", "")
+    lead_name = html.escape(str(lead["name"]))
+    body = f"""
+<Response>
+  <Connect>
+    <Stream url="wss://{host}/greenhouse/stream/{call_id}">
+      <Parameter name="lead_name" value="{lead_name}" />
+    </Stream>
+  </Connect>
+</Response>
+""".strip()
+    return Response(body, media_type="application/xml")
+
+
+@app.post("/greenhouse/status/{call_id}")
+async def status(call_id: int, request: Request) -> dict[str, str]:
+    form = await request.form()
+    payload = dict(form)
+    append_event(call_id, "twilio_status", payload)
+    call_status = str(payload.get("CallStatus", ""))
+    if call_status:
+        update_call(call_id, status=call_status)
+        if call_status == "completed":
+            lead = lead_for_call(call_id)
+            if lead is not None:
+                mark_lead_status(int(lead["id"]), "called")
+        elif call_status in {"busy", "failed", "no-answer", "canceled"}:
+            lead = lead_for_call(call_id)
+            if lead is not None:
+                mark_lead_status(int(lead["id"]), "failed")
+    return {"ok": "true"}
+
+
+@app.websocket("/greenhouse/stream/{call_id}")
+async def stream(call_id: int, websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        await bridge_call(call_id, websocket)
+    except WebSocketDisconnect:
+        append_event(call_id, "websocket_disconnect", {})

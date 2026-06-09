@@ -1,0 +1,15 @@
+[Unit]
+Description=Greenhouse Contractor Caller FastAPI app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/greenhouse-contractor-caller
+EnvironmentFile=/etc/greenhouse-contractor-caller/env
+ExecStart=/opt/greenhouse-contractor-caller/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8005
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
