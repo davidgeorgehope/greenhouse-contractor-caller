@@ -32,11 +32,13 @@ def discovery_queries(job) -> list[str]:
     description = str(job["description"] or "")
     location = str(job["location"] or "Gasport NY")
     nearby = "Gasport Lockport Niagara County Buffalo NY"
-    terms = [title, job_type]
+    terms = [title]
     if "door" in f"{title} {job_type} {description}".lower():
         terms.extend(["door installer", "handyman exterior door", "carpenter"])
     if "greenhouse" in f"{title} {job_type} {description}".lower():
-        terms.extend(["greenhouse installer", "handyman assembly", "general contractor"])
+        terms.extend(["greenhouse installer", "greenhouse assembly handyman", "shed gazebo assembly"])
+    if not terms:
+        terms.append(job_type)
     seen: set[str] = set()
     queries: list[str] = []
     for term in terms:
@@ -47,6 +49,105 @@ def discovery_queries(job) -> list[str]:
     if location and "Gasport" not in location:
         queries.append(f"{title} contractor near {location}")
     return queries[:4]
+
+
+def _job_terms(job) -> set[str]:
+    haystack = f"{job['title']} {job['job_type']} {job['description']}".lower()
+    terms: set[str] = set()
+    if "greenhouse" in haystack:
+        terms.update({"greenhouse", "assembly", "installer", "installation", "handyman", "shed", "gazebo"})
+    if "door" in haystack:
+        terms.update({"door", "carpenter", "installation", "installer", "handyman"})
+    for word in re.findall(r"[a-z][a-z0-9]{3,}", haystack):
+        if word not in {"contractor", "general", "need", "needs", "near", "help", "with"}:
+            terms.add(word)
+    return terms or {"contractor", "handyman"}
+
+
+def _irrelevant_terms_for_job(job) -> set[str]:
+    haystack = f"{job['title']} {job['job_type']} {job['description']}".lower()
+    irrelevant = {
+        "auto",
+        "automotive",
+        "car dealer",
+        "dentist",
+        "doctor",
+        "lawyer",
+        "restaurant",
+        "hotel",
+        "property management",
+        "real estate",
+    }
+    if "greenhouse" in haystack:
+        irrelevant.update(
+            {
+                "garage door",
+                "overhead door",
+                "roofing",
+                "siding",
+                "gutter",
+                "hvac",
+                "plumbing",
+                "electrician",
+                "pest control",
+                "lawn care",
+                "snow removal",
+            }
+        )
+    return irrelevant
+
+
+def result_fit_score(job, result: SearchResult, page_text: str = "") -> tuple[int, list[str]]:
+    text = f"{result.title} {result.snippet} {page_text[:4000]}".lower()
+    url = result.url.lower()
+    score = 0
+    reasons: list[str] = []
+
+    for term in sorted(_job_terms(job), key=len, reverse=True):
+        if term and term in text:
+            score += 18 if term in {"greenhouse", "door"} else 8
+            reasons.append(f"matched:{term}")
+
+    contractor_markers = {
+        "contractor",
+        "handyman",
+        "installer",
+        "installation",
+        "assembly",
+        "repair",
+        "construction",
+        "carpentry",
+        "home improvement",
+    }
+    for marker in contractor_markers:
+        if marker in text:
+            score += 7
+            reasons.append(f"trade:{marker}")
+            break
+
+    local_markers = {"buffalo", "gasport", "lockport", "niagara", "wny", "western new york"}
+    if any(marker in text for marker in local_markers) or any(marker.replace(" ", "") in url for marker in local_markers):
+        score += 10
+        reasons.append("local")
+
+    if phones_from_text(text):
+        score += 5
+        reasons.append("phone")
+    if emails_from_text(text):
+        score += 2
+        reasons.append("email")
+
+    for bad in _irrelevant_terms_for_job(job):
+        if bad in text:
+            score -= 35
+            reasons.append(f"irrelevant:{bad}")
+
+    directory_hosts = ("yelp.", "angi.", "thumbtack.", "homeadvisor.", "bbb.", "mapquest.", "yellowpages.")
+    if any(host in url for host in directory_hosts):
+        score -= 8
+        reasons.append("directory")
+
+    return score, reasons
 
 
 def normalize_phone(value: str) -> str | None:
@@ -180,13 +281,19 @@ def discover_leads_for_job(job_id: int, query: str | None = None, user_id: int |
             phones = phones_from_text(combined)
             emails = emails_from_text(combined)
             page_text = ""
-            if not phones or not emails:
+            initial_score, _ = result_fit_score(job, result)
+            if initial_score < 25 or not phones or not emails:
                 page_text = _page_text(result.url)
-                if not phones:
-                    phones = phones_from_text(page_text)
-                if not emails:
-                    emails = emails_from_text(page_text)
+            fit_score, fit_reasons = result_fit_score(job, result, page_text)
+            if fit_score < 25:
+                continue
             if not phones:
+                phones = phones_from_text(page_text)
+            if not emails:
+                emails = emails_from_text(page_text)
+            if not phones:
+                continue
+            if fit_score < 35 and not emails:
                 continue
             phone = phones[0]
             if phone in seen_phones:
@@ -209,7 +316,11 @@ def discover_leads_for_job(job_id: int, query: str | None = None, user_id: int |
                 origin_lat = coords.lat
                 origin_lng = coords.lng
                 origin_address = title
-            notes = f"Discovered from search query: {search_query}. Review fit before executing outreach."
+            notes = (
+                f"Discovered from search query: {search_query}. "
+                f"Fit score {fit_score} ({', '.join(fit_reasons[:6])}). "
+                "Review fit before executing outreach."
+            )
             if result.snippet:
                 notes += f" Snippet: {result.snippet[:280]}"
             upsert_lead(
@@ -226,7 +337,7 @@ def discover_leads_for_job(job_id: int, query: str | None = None, user_id: int |
                 drive_minutes=drive_minutes,
                 service_area="",
                 notes=notes,
-                priority=60,
+                priority=max(10, min(95, fit_score)),
                 status="review",
             )
             created += 1
