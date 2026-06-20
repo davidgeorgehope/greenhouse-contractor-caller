@@ -7,7 +7,17 @@ from typing import Any
 import sqlite3
 
 from .config import get_settings
-from .db import billing_is_active, upsert_user_billing, upsert_user_billing_by_customer
+from .db import (
+    active_job_count,
+    billing_is_active,
+    consume_call_credit,
+    ensure_user_entitlements,
+    get_user_billing,
+    grant_period_call_credits,
+    lead_count_for_job,
+    upsert_user_billing,
+    upsert_user_billing_by_customer,
+)
 
 
 ACTIVE_BILLING_STATUSES = {"active", "trialing"}
@@ -25,10 +35,53 @@ def can_use_paid_workflows(user_id: int) -> bool:
     return billing_is_active(user_id)
 
 
+def sync_default_entitlements(user_id: int) -> None:
+    settings = get_settings()
+    ensure_user_entitlements(
+        user_id,
+        active_jobs_limit=settings.contractor_plan_active_jobs,
+        leads_per_job_limit=settings.contractor_plan_leads_per_job,
+        call_credits_per_period=settings.contractor_plan_call_credits,
+    )
+
+
+def call_credits_remaining(user_id: int) -> int:
+    billing = get_user_billing(user_id)
+    if not billing:
+        return 0
+    return int(billing["call_credits_remaining"] or 0)
+
+
+def can_create_paid_job(user_id: int) -> bool:
+    if not can_use_paid_workflows(user_id):
+        return False
+    billing = get_user_billing(user_id)
+    limit = int(billing["plan_active_jobs_limit"] if billing else get_settings().contractor_plan_active_jobs)
+    return active_job_count(user_id) < limit
+
+
+def can_add_paid_lead(user_id: int, job_id: int) -> bool:
+    if not can_use_paid_workflows(user_id):
+        return False
+    billing = get_user_billing(user_id)
+    limit = int(billing["plan_leads_per_job_limit"] if billing else get_settings().contractor_plan_leads_per_job)
+    return lead_count_for_job(job_id) < limit
+
+
+def reserve_call_credit(user_id: int | None) -> bool:
+    settings = get_settings()
+    if not settings.contractor_billing_required:
+        return True
+    if user_id is None:
+        return False
+    return consume_call_credit(user_id)
+
+
 def create_checkout_session(user: sqlite3.Row) -> str:
     settings = get_settings()
     if not billing_configured():
         raise RuntimeError("Stripe billing is not configured")
+    sync_default_entitlements(int(user["id"]))
 
     import stripe
 
@@ -96,9 +149,32 @@ def handle_stripe_event(event: Any) -> None:
         if not customer_id:
             return
         status = str(data.get("status") or "inactive")
-        upsert_user_billing_by_customer(
+        current_period_end = _timestamp_to_iso(data.get("current_period_end"))
+        updated = upsert_user_billing_by_customer(
             stripe_customer_id=str(customer_id),
             stripe_subscription_id=str(data.get("id")) if data.get("id") else None,
             status=status,
-            current_period_end=_timestamp_to_iso(data.get("current_period_end")),
+            current_period_end=current_period_end,
         )
+        if updated and status in ACTIVE_BILLING_STATUSES:
+            settings = get_settings()
+            user_id = _user_id_for_customer(str(customer_id))
+            if user_id is not None:
+                grant_period_call_credits(
+                    user_id,
+                    period_end=current_period_end,
+                    credits=settings.contractor_plan_call_credits,
+                    active_jobs_limit=settings.contractor_plan_active_jobs,
+                    leads_per_job_limit=settings.contractor_plan_leads_per_job,
+                )
+
+
+def _user_id_for_customer(stripe_customer_id: str) -> int | None:
+    from .db import connect
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM user_billing WHERE stripe_customer_id = ?",
+            (stripe_customer_id,),
+        ).fetchone()
+        return int(row["user_id"]) if row else None

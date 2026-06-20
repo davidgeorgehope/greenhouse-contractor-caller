@@ -7,7 +7,16 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .agent import run_job_agent
 from .auth import authenticate_user, create_session, create_user, delete_session, has_users, require_user
-from .billing import billing_configured, can_use_paid_workflows, create_checkout_session, handle_stripe_event, parse_stripe_event
+from .billing import (
+    billing_configured,
+    call_credits_remaining,
+    can_add_paid_lead,
+    can_create_paid_job,
+    can_use_paid_workflows,
+    create_checkout_session,
+    handle_stripe_event,
+    parse_stripe_event,
+)
 from .caller import place_calls, place_test_call
 from .config import get_settings
 from .contact import normalize_phone, resolve_lead_for_email, resolve_lead_for_phone
@@ -444,10 +453,12 @@ def contractor_dashboard(
     outreach_sent: str = "",
     outreach_blocked: str = "",
     outreach_failed: str = "",
+    limit: str = "",
 ) -> str:
     user = require_user(request)
-    jobs = list_jobs()
-    selected_job = job_for_id(job_id) if job_id else (jobs[0] if jobs else None)
+    user_id = int(user["id"])
+    jobs = list_jobs(user_id)
+    selected_job = job_for_id(job_id, user_id) if job_id else (jobs[0] if jobs else None)
     selected_job_id = int(selected_job["id"]) if selected_job else None
     leads = leads_for_job(selected_job_id) if selected_job_id else []
     calls = calls_for_job(selected_job_id) if selected_job_id else []
@@ -455,9 +466,10 @@ def contractor_dashboard(
     texts = sms_for_job(selected_job_id) if selected_job_id else []
     emails = emails_for_job(selected_job_id) if selected_job_id else []
     settings = get_settings()
-    billing = get_user_billing(int(user["id"]))
+    billing = get_user_billing(user_id)
     billing_status = billing["status"] if billing else "inactive"
-    billing_active = can_use_paid_workflows(int(user["id"]))
+    billing_active = can_use_paid_workflows(user_id)
+    call_credits = call_credits_remaining(user_id)
 
     def esc(value: object) -> str:
         return html.escape("" if value is None else str(value))
@@ -585,6 +597,12 @@ def contractor_dashboard(
         agent_notice += f"""<p class="notice">Cleaned out {esc(test_cleanup)} test call{'s' if test_cleanup != '1' else ''} for this job.</p>"""
     if outreach_sent or outreach_blocked or outreach_failed:
         agent_notice += f"""<p class="notice">Follow-ups processed: {esc(outreach_sent or 0)} sent, {esc(outreach_blocked or 0)} blocked, {esc(outreach_failed or 0)} failed.</p>"""
+    if limit == "jobs":
+        agent_notice += """<p class="warning">Active job limit reached. Finish or archive an existing job before creating another.</p>"""
+    elif limit == "leads":
+        agent_notice += """<p class="warning">Contractor lead limit reached for this job. Skip a lead or add credits before adding more.</p>"""
+    elif limit == "credits":
+        agent_notice += """<p class="warning">No call credits remain. Add credits before placing more contractor calls.</p>"""
     billing_panel = ""
     if settings.contractor_billing_required and not billing_active:
         billing_panel = """
@@ -703,7 +721,7 @@ def contractor_dashboard(
   </style>
 </head>
 <body>
-  <header><div><h1>{esc(settings.contractor_product_name)}</h1><span>Write the brief. Launch outreach. Review what happened. Billing: {esc(billing_status)}</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
+  <header><div><h1>{esc(settings.contractor_product_name)}</h1><span>Write the brief. Launch outreach. Review what happened. Billing: {esc(billing_status)} · Call credits: {call_credits}</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
   <main>
     <aside>
       <h2>Jobs</h2>
@@ -887,8 +905,13 @@ def create_contractor_job(
     location: str = Form(""),
     brief: str = Form(""),
 ) -> RedirectResponse:
-    require_user(request)
-    job_id = create_job(title=title, job_type=job_type, description=description, location=location)
+    user = require_user(request)
+    user_id = int(user["id"])
+    if get_settings().contractor_billing_required and not can_create_paid_job(user_id):
+        if not can_use_paid_workflows(user_id):
+            return RedirectResponse("/contractor/billing?required=1", status_code=303)
+        return RedirectResponse("/contractor?limit=jobs", status_code=303)
+    job_id = create_job(title=title, job_type=job_type, description=description, location=location, user_id=user_id)
     if brief.strip():
         update_job_brief(job_id, brief, title=title, description=description, location=location)
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
@@ -927,7 +950,10 @@ def add_contractor_lead(
     notes: str = Form(""),
     priority: int = Form(50),
 ) -> RedirectResponse:
-    require_user(request)
+    user = require_user(request)
+    user_id = int(user["id"])
+    if get_settings().contractor_billing_required and not can_add_paid_lead(user_id, job_id):
+        return RedirectResponse(f"/contractor?job_id={job_id}&limit=leads", status_code=303)
     upsert_lead(
         job_id=job_id,
         name=name,
@@ -951,6 +977,8 @@ def discover_contractor_leads(
     user = require_user(request)
     if not can_use_paid_workflows(int(user["id"])):
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
+    if not can_add_paid_lead(int(user["id"]), job_id):
+        return RedirectResponse(f"/contractor?job_id={job_id}&limit=leads", status_code=303)
     result = discover_leads_for_job(job_id, query=query)
     return RedirectResponse(
         f"/contractor?job_id={job_id}&discovered={int(result['created'])}&searched={int(result['searched'])}",
@@ -1005,7 +1033,9 @@ def run_call_loop(request: Request, background_tasks: BackgroundTasks, job_id: i
     user = require_user(request)
     if not can_use_paid_workflows(int(user["id"])):
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
-    background_tasks.add_task(place_calls, job_id=job_id, include_unknown_travel=True)
+    if call_credits_remaining(int(user["id"])) <= 0:
+        return RedirectResponse(f"/contractor?job_id={job_id}&limit=credits", status_code=303)
+    background_tasks.add_task(place_calls, job_id=job_id, include_unknown_travel=True, user_id=int(user["id"]))
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
 
@@ -1028,7 +1058,9 @@ def hand_job_to_agent(request: Request, background_tasks: BackgroundTasks, job_i
     user = require_user(request)
     if not can_use_paid_workflows(int(user["id"])):
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
-    background_tasks.add_task(run_job_agent, job_id)
+    if call_credits_remaining(int(user["id"])) <= 0:
+        return RedirectResponse(f"/contractor?job_id={job_id}&limit=credits", status_code=303)
+    background_tasks.add_task(run_job_agent, job_id, int(user["id"]))
     return RedirectResponse(f"/contractor?job_id={job_id}&agent=started", status_code=303)
 
 

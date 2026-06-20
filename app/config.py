@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     contractor_email_ingest_secret: str = ""
     contractor_product_name: str = "Contractor Relief"
     contractor_billing_required: bool = False
+    contractor_plan_active_jobs: int = 5
+    contractor_plan_call_credits: int = 10
+    contractor_plan_leads_per_job: int = 10
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
     stripe_price_id: str = ""

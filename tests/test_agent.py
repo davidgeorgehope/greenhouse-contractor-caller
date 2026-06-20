@@ -29,10 +29,12 @@ def test_job_agent_activates_job_promotes_reviews_and_calls(tmp_path, monkeypatc
     def fake_discover(job_id: int) -> dict[str, object]:
         return {"created": 0, "searched": 0, "errors": [], "queries": []}
 
-    placed_calls: list[tuple[int | None, bool]] = []
+    placed_calls: list[tuple[int | None, bool, int | None]] = []
 
-    def fake_place_calls(*, job_id: int | None = None, include_unknown_travel: bool = False) -> list[str]:
-        placed_calls.append((job_id, include_unknown_travel))
+    def fake_place_calls(
+        *, job_id: int | None = None, include_unknown_travel: bool = False, user_id: int | None = None
+    ) -> list[str]:
+        placed_calls.append((job_id, include_unknown_travel, user_id))
         return ["placed"]
 
     monkeypatch.setattr("app.agent.discover_leads_for_job", fake_discover)
@@ -43,7 +45,7 @@ def test_job_agent_activates_job_promotes_reviews_and_calls(tmp_path, monkeypatc
 
     assert job_for_id(job_id)["status"] == "active"
     assert leads[0]["status"] == "pending"
-    assert placed_calls == [(job_id, True)]
+    assert placed_calls == [(job_id, True, None)]
     assert result["promoted"] == 1
     assert result["calls"] == 1
     get_settings.cache_clear()

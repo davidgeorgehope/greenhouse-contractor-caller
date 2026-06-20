@@ -8,6 +8,7 @@ from .config import get_settings
 from .contact import normalize_phone
 from .db import create_call, leads_for_job, mark_lead_status, next_pending_leads, update_call, upsert_lead
 from .followup import create_call_followups
+from .billing import reserve_call_credit
 
 TERMINAL_CALL_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"}
 
@@ -40,7 +41,7 @@ def _wait_for_call(client: Client, call_sid: str, max_wait_seconds: int) -> str:
     return status
 
 
-def place_calls(*, job_id: int | None = None, include_unknown_travel: bool = False) -> list[str]:
+def place_calls(*, job_id: int | None = None, include_unknown_travel: bool = False, user_id: int | None = None) -> list[str]:
     settings = get_settings()
     if settings.caller_disabled:
         print("caller disabled; set CALLER_DISABLED=0 to place calls")
@@ -57,6 +58,11 @@ def place_calls(*, job_id: int | None = None, include_unknown_travel: bool = Fal
         job_id=job_id,
         include_unknown_travel=include_unknown_travel,
     ):
+        if not reserve_call_credit(user_id):
+            line = "blocked: no call credits remaining"
+            print(line)
+            placed.append(line)
+            break
         call_id = create_call(int(lead["id"]))
         call = _create_twilio_call(client, to_number=str(lead["phone"]), call_id=call_id)
         update_call(call_id, twilio_sid=call.sid, status="placed")

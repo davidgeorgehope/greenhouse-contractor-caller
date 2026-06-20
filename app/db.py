@@ -11,6 +11,7 @@ from .config import get_settings
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER REFERENCES users(id),
   title TEXT NOT NULL,
   job_type TEXT NOT NULL DEFAULT 'general',
   description TEXT NOT NULL DEFAULT '',
@@ -61,6 +62,11 @@ CREATE TABLE IF NOT EXISTS user_billing (
   stripe_subscription_id TEXT,
   status TEXT NOT NULL DEFAULT 'inactive',
   current_period_end TEXT,
+  call_credits_remaining INTEGER NOT NULL DEFAULT 0,
+  plan_active_jobs_limit INTEGER NOT NULL DEFAULT 5,
+  plan_leads_per_job_limit INTEGER NOT NULL DEFAULT 10,
+  plan_call_credits_per_period INTEGER NOT NULL DEFAULT 10,
+  last_credit_grant_period_end TEXT,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -181,6 +187,18 @@ CALL_COLUMNS: dict[str, str] = {
     "direction": "TEXT NOT NULL DEFAULT 'outbound'",
 }
 
+JOB_COLUMNS: dict[str, str] = {
+    "user_id": "INTEGER REFERENCES users(id)",
+}
+
+USER_BILLING_COLUMNS: dict[str, str] = {
+    "call_credits_remaining": "INTEGER NOT NULL DEFAULT 0",
+    "plan_active_jobs_limit": "INTEGER NOT NULL DEFAULT 5",
+    "plan_leads_per_job_limit": "INTEGER NOT NULL DEFAULT 10",
+    "plan_call_credits_per_period": "INTEGER NOT NULL DEFAULT 10",
+    "last_credit_grant_period_end": "TEXT",
+}
+
 
 def connect() -> sqlite3.Connection:
     settings = get_settings()
@@ -189,14 +207,23 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _ensure_job_columns(conn)
     _ensure_lead_columns(conn)
     _ensure_call_columns(conn)
+    _ensure_user_billing_columns(conn)
     _ensure_default_job(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_travel ON leads(status, drive_minutes, distance_miles)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_leads_job_status_priority ON leads(job_id, status, priority DESC, id)"
     )
     return conn
+
+
+def _ensure_job_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    for name, definition in JOB_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
 
 def _ensure_lead_columns(conn: sqlite3.Connection) -> None:
@@ -211,6 +238,13 @@ def _ensure_call_columns(conn: sqlite3.Connection) -> None:
     for name, definition in CALL_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
+
+
+def _ensure_user_billing_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(user_billing)")}
+    for name, definition in USER_BILLING_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE user_billing ADD COLUMN {name} {definition}")
 
 
 def _ensure_default_job(conn: sqlite3.Connection) -> None:
@@ -261,15 +295,15 @@ def default_job_brief(title: str, description: str, location: str) -> str:
     return "\n".join(lines)
 
 
-def create_job(*, title: str, job_type: str, description: str, location: str) -> int:
+def create_job(*, title: str, job_type: str, description: str, location: str, user_id: int | None = None) -> int:
     brief = default_job_brief(title, description, location)
     with connect() as conn:
         cur = conn.execute(
             """
-            INSERT INTO jobs(title, job_type, description, location, brief, status)
-            VALUES (?, ?, ?, ?, ?, 'planning')
+            INSERT INTO jobs(user_id, title, job_type, description, location, brief, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'planning')
             """,
-            (title, job_type, description, location, brief),
+            (user_id, title, job_type, description, location, brief),
         )
         return int(cur.lastrowid)
 
@@ -314,6 +348,109 @@ def get_user_billing(user_id: int) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM user_billing WHERE user_id = ?", (user_id,)).fetchone()
 
 
+def ensure_user_entitlements(
+    user_id: int,
+    *,
+    active_jobs_limit: int,
+    leads_per_job_limit: int,
+    call_credits_per_period: int,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_billing(
+              user_id, status, plan_active_jobs_limit, plan_leads_per_job_limit, plan_call_credits_per_period
+            )
+            VALUES (?, 'inactive', ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              plan_active_jobs_limit=excluded.plan_active_jobs_limit,
+              plan_leads_per_job_limit=excluded.plan_leads_per_job_limit,
+              plan_call_credits_per_period=excluded.plan_call_credits_per_period,
+              updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, active_jobs_limit, leads_per_job_limit, call_credits_per_period),
+        )
+
+
+def grant_period_call_credits(
+    user_id: int,
+    *,
+    period_end: str | None,
+    credits: int,
+    active_jobs_limit: int,
+    leads_per_job_limit: int,
+) -> None:
+    grant_marker = period_end or "checkout"
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM user_billing WHERE user_id = ?", (user_id,)).fetchone()
+        if existing and existing["last_credit_grant_period_end"] == grant_marker:
+            return
+        conn.execute(
+            """
+            INSERT INTO user_billing(
+              user_id, status, call_credits_remaining, plan_active_jobs_limit,
+              plan_leads_per_job_limit, plan_call_credits_per_period, last_credit_grant_period_end
+            )
+            VALUES (?, 'active', ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              call_credits_remaining=user_billing.call_credits_remaining + excluded.call_credits_remaining,
+              plan_active_jobs_limit=excluded.plan_active_jobs_limit,
+              plan_leads_per_job_limit=excluded.plan_leads_per_job_limit,
+              plan_call_credits_per_period=excluded.plan_call_credits_per_period,
+              last_credit_grant_period_end=excluded.last_credit_grant_period_end,
+              updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, credits, active_jobs_limit, leads_per_job_limit, credits, grant_marker),
+        )
+
+
+def add_call_credits(user_id: int, credits: int) -> None:
+    if credits <= 0:
+        return
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_billing(user_id, call_credits_remaining)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              call_credits_remaining=user_billing.call_credits_remaining + excluded.call_credits_remaining,
+              updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, credits),
+        )
+
+
+def consume_call_credit(user_id: int) -> bool:
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE user_billing
+            SET call_credits_remaining = call_credits_remaining - 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+              AND status IN ('active', 'trialing')
+              AND call_credits_remaining > 0
+            """,
+            (user_id,),
+        )
+        return cur.rowcount == 1
+
+
+def active_job_count(user_id: int) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE user_id = ? AND status IN ('planning', 'active')",
+            (user_id,),
+        ).fetchone()
+        return int(row["count"])
+
+
+def lead_count_for_job(job_id: int) -> int:
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM leads WHERE job_id = ?", (job_id,)).fetchone()
+        return int(row["count"])
+
+
 def billing_is_active(user_id: int) -> bool:
     billing = get_user_billing(user_id)
     return bool(billing and billing["status"] in {"active", "trialing"})
@@ -330,7 +467,9 @@ def upsert_user_billing(
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO user_billing(user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end)
+            INSERT INTO user_billing(
+              user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end
+            )
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
               stripe_customer_id=COALESCE(excluded.stripe_customer_id, user_billing.stripe_customer_id),
@@ -403,26 +542,32 @@ def update_job_brief(
         return cur.rowcount > 0
 
 
-def list_jobs() -> list[sqlite3.Row]:
+def list_jobs(user_id: int | None = None) -> list[sqlite3.Row]:
+    user_clause = "WHERE (jobs.user_id = ? OR jobs.user_id IS NULL)" if user_id is not None else ""
+    params: tuple[object, ...] = (user_id,) if user_id is not None else ()
     with connect() as conn:
         return list(
             conn.execute(
-                """
+                f"""
                 SELECT jobs.*,
                   COUNT(leads.id) AS lead_count,
                   SUM(CASE WHEN leads.status IN ('pending', 'calling') THEN 1 ELSE 0 END) AS open_lead_count
                 FROM jobs
                 LEFT JOIN leads ON leads.job_id = jobs.id
+                {user_clause}
                 GROUP BY jobs.id
                 ORDER BY jobs.updated_at DESC, jobs.id DESC
-                """
+                """,
+                params,
             )
         )
 
 
-def job_for_id(job_id: int) -> sqlite3.Row | None:
+def job_for_id(job_id: int, user_id: int | None = None) -> sqlite3.Row | None:
+    user_clause = "AND (user_id = ? OR user_id IS NULL)" if user_id is not None else ""
+    params: tuple[object, ...] = (job_id, user_id) if user_id is not None else (job_id,)
     with connect() as conn:
-        return conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return conn.execute(f"SELECT * FROM jobs WHERE id = ? {user_clause}", params).fetchone()
 
 
 def active_job() -> sqlite3.Row | None:
