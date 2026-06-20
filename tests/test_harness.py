@@ -132,3 +132,97 @@ def test_test_contractor_agent_blocks_without_credits(monkeypatch, tmp_path) -> 
 
     with pytest.raises(RuntimeError):
         simulate_test_contractor_call(job_id=job_id, user_id=user_id)
+
+
+def test_realtime_test_contractor_agent_uses_gpt_realtime_and_consumes_credit(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("CONTRACTOR_BILLING_REQUIRED", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
+
+    import asyncio
+    import json
+
+    from app.auth import create_user
+    from app.billing import call_credits_remaining
+    from app.config import get_settings
+    from app.db import call_for_id, create_job
+    from app.test_harness import activate_test_subscription, simulate_realtime_test_contractor_call
+
+    get_settings.cache_clear()
+    sent_messages: list[dict[str, object]] = []
+    connect_calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeRealtime:
+        def __init__(self) -> None:
+            self._done = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def send(self, message: str) -> None:
+            sent_messages.append(json.loads(message))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            if self._done:
+                raise StopAsyncIteration
+            self._done = True
+            return json.dumps(
+                {
+                    "type": "response.done",
+                    "response": {
+                        "output": [
+                            {
+                                "content": [
+                                    {
+                                        "text": json.dumps(
+                                            {
+                                                "transcript": "Sam: Can you help?\nContractor: Yes, send photos.",
+                                                "summary": "Realtime test contractor needs photos before quoting.",
+                                                "outcome": "conversation",
+                                            }
+                                        )
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                }
+            )
+
+    def fake_connect(uri: str, **kwargs):
+        connect_calls.append((uri, kwargs))
+        return FakeRealtime()
+
+    monkeypatch.setattr("app.test_harness.websockets.connect", fake_connect)
+    user_id = create_user(email="owner@example.com", password="long-password-123", display_name="Owner")
+    assert activate_test_subscription(user_id) is True
+    job_id = create_job(
+        title="Greenhouse assembly",
+        job_type="assembly",
+        description="Assemble greenhouse.",
+        location="Gasport",
+        user_id=user_id,
+    )
+
+    call_id = asyncio.run(
+        simulate_realtime_test_contractor_call(job_id=job_id, user_id=user_id, scenario="needs_photos")
+    )
+
+    call = call_for_id(call_id)
+    assert call is not None
+    assert call["direction"] == "test_realtime_agent"
+    assert call["twilio_sid"] == f"TEST_REALTIME_{call_id}"
+    assert call["status"] == "completed"
+    assert call["outcome"] == "conversation"
+    assert "needs photos" in call["summary"].lower()
+    assert "Realtime test contractor" in call["lead_name"]
+    assert call_credits_remaining(user_id) == 9
+    assert connect_calls[0][0] == "wss://api.openai.com/v1/realtime?model=gpt-realtime-2"
+    assert sent_messages[0]["session"]["output_modalities"] == ["text"]

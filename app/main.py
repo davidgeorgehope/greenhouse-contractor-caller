@@ -56,6 +56,7 @@ from .test_harness import (
     activate_test_subscription,
     add_test_call_credits,
     reset_local_test_billing,
+    simulate_realtime_test_contractor_call,
     simulate_test_contractor_call,
 )
 from .voice import bridge_call
@@ -695,6 +696,8 @@ def contractor_dashboard(
     agent_notice = ""
     if agent == "started":
         agent_notice = """<p class="notice">Contractor Relief is working this brief now. Refresh for new leads, calls, texts, and transcripts.</p>"""
+    elif agent == "error":
+        agent_notice = """<p class="warning">Realtime test contractor failed before completing. Check the event log for the captured error.</p>"""
     if test_call == "started":
         agent_notice += """<p class="notice">Test call started. It will appear in call history once Twilio reports back.</p>"""
     if test_cleanup:
@@ -736,6 +739,14 @@ def contractor_dashboard(
             </form>
             <form method="post" action="/contractor/jobs/{selected_job_id}/test-agent">
               <button type="submit" class="secondary">Run test contractor</button>
+            </form>
+            <form method="post" action="/contractor/jobs/{selected_job_id}/test-agent/realtime">
+              <select name="scenario" aria-label="Realtime test contractor scenario">
+                <option value="available">Available</option>
+                <option value="needs_photos">Needs photos</option>
+                <option value="busy">Booked out</option>
+              </select>
+              <button type="submit" class="secondary">Run Realtime test contractor</button>
             </form>
         """
 
@@ -1174,6 +1185,19 @@ def run_test_contractor_agent(request: Request, job_id: int, scenario: str = For
         call_id = simulate_test_contractor_call(job_id=job_id, user_id=int(user["id"]), scenario=scenario)
     except RuntimeError:
         return RedirectResponse(f"/contractor?job_id={job_id}&limit=credits", status_code=303)
+    return RedirectResponse(f"/contractor?job_id={job_id}&test_agent={call_id}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/test-agent/realtime")
+async def run_realtime_test_contractor_agent(request: Request, job_id: int, scenario: str = Form("available")) -> RedirectResponse:
+    user = _require_owner_user(request)
+    try:
+        call_id = await simulate_realtime_test_contractor_call(job_id=job_id, user_id=int(user["id"]), scenario=scenario)
+    except RuntimeError as exc:
+        if "credits" in str(exc).lower():
+            return RedirectResponse(f"/contractor?job_id={job_id}&limit=credits", status_code=303)
+        append_event(None, "realtime_test_agent_error", {"job_id": job_id, "error": str(exc)})
+        return RedirectResponse(f"/contractor?job_id={job_id}&agent=error", status_code=303)
     return RedirectResponse(f"/contractor?job_id={job_id}&test_agent={call_id}", status_code=303)
 
 

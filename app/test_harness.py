@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+
+import websockets
 
 from .billing import reserve_call_credit
 from .config import get_settings
@@ -21,6 +24,7 @@ from .db import (
 
 TEST_CUSTOMER_PREFIX = "cus_test_local_"
 TEST_SUBSCRIPTION_PREFIX = "sub_test_local_"
+REALTIME_TEST_CONTRACTOR_NAME = "Realtime test contractor"
 
 
 def activate_test_subscription(user_id: int) -> bool:
@@ -123,6 +127,158 @@ def simulate_test_contractor_call(*, job_id: int, user_id: int, scenario: str = 
         },
     )
     return call_id
+
+
+async def simulate_realtime_test_contractor_call(*, job_id: int, user_id: int, scenario: str = "available") -> int:
+    settings = get_settings()
+    if not settings.openai_api_key:
+        raise RuntimeError("Missing OpenAI API key for Realtime test contractor")
+
+    job = job_for_id(job_id, user_id)
+    if job is None:
+        raise ValueError("Job not found for user")
+    if not reserve_call_credit(user_id):
+        raise RuntimeError("No call credits remaining")
+
+    phone = "+17165550198"
+    upsert_lead(
+        job_id=job_id,
+        name=REALTIME_TEST_CONTRACTOR_NAME,
+        phone=phone,
+        email="realtime-test-contractor@example.com",
+        category="test_call",
+        source_url="realtime-test-harness",
+        notes="GPT Realtime fake contractor used by the owner-only end-to-end test harness.",
+        priority=98,
+        status="pending",
+    )
+    lead = next((row for row in leads_for_job(job_id) if str(row["phone"]) == phone), None)
+    if lead is None:
+        raise RuntimeError("Could not create Realtime test contractor lead")
+
+    call_id = create_call(int(lead["id"]), direction="test_realtime_agent")
+    now = datetime.now(UTC).isoformat()
+    update_call(call_id, twilio_sid=f"TEST_REALTIME_{call_id}", status="in_progress", started_at=now)
+    append_event(
+        call_id,
+        "realtime_test_agent_started",
+        {
+            "scenario": scenario,
+            "job_id": job_id,
+            "user_id": user_id,
+            "model": settings.openai_realtime_model,
+            "consumed_call_credit": True,
+        },
+    )
+
+    raw_response = await _run_realtime_contractor_scenario(
+        job_title=str(job["title"]),
+        job_description=str(job["description"]),
+        job_location=str(job["location"]),
+        scenario=scenario,
+    )
+    transcript, summary, outcome = _parse_realtime_result(raw_response, str(job["title"]), scenario)
+    ended = datetime.now(UTC).isoformat()
+    update_call(
+        call_id,
+        status="completed",
+        outcome=outcome,
+        summary=summary,
+        transcript=transcript,
+        ended_at=ended,
+    )
+    mark_lead_status(int(lead["id"]), "called")
+    append_event(call_id, "realtime_test_agent_completed", {"raw_response": raw_response})
+    return call_id
+
+
+async def _run_realtime_contractor_scenario(
+    *, job_title: str, job_description: str, job_location: str, scenario: str
+) -> str:
+    settings = get_settings()
+    uri = f"wss://api.openai.com/v1/realtime?model={settings.openai_realtime_model}"
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    text_parts: list[str] = []
+    instructions = (
+        "You are a fake contractor used by Contractor Relief's automated test harness. "
+        "Stay in character as a real local contractor. Return only compact JSON with keys "
+        "transcript, summary, and outcome. The transcript should show both Sam and Contractor lines. "
+        "Outcome must be one of conversation, likely_no, voicemail, or ivr."
+    )
+    scenario_prompt = (
+        f"Scenario: {scenario}\n"
+        f"Job title: {job_title}\n"
+        f"Job location: {job_location}\n"
+        f"Job description: {job_description}\n"
+        "Sam opens with: Hi, this is Sam calling for the customer. "
+        f"They are looking for help with {job_title} near {job_location}. "
+        "Is that something you can help with?\n"
+        "Generate the contractor side and the resulting short transcript."
+    )
+
+    async with websockets.connect(uri, additional_headers=headers) as openai_ws:
+        await openai_ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "realtime",
+                        "instructions": instructions,
+                        "output_modalities": ["text"],
+                    },
+                }
+            )
+        )
+        await openai_ws.send(
+            json.dumps(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": scenario_prompt}],
+                    },
+                }
+            )
+        )
+        await openai_ws.send(json.dumps({"type": "response.create", "response": {"output_modalities": ["text"]}}))
+        async for raw in openai_ws:
+            data = json.loads(raw)
+            event_type = str(data.get("type", ""))
+            if event_type in {"response.output_text.delta", "response.text.delta"}:
+                text_parts.append(str(data.get("delta") or ""))
+            elif event_type in {"response.output_text.done", "response.text.done"}:
+                text_parts.append(str(data.get("text") or ""))
+            elif event_type == "response.done":
+                output = data.get("response", {}).get("output", [])
+                for item in output if isinstance(output, list) else []:
+                    for content in item.get("content", []) if isinstance(item, dict) else []:
+                        if isinstance(content, dict) and content.get("text"):
+                            text_parts.append(str(content["text"]))
+                break
+            elif event_type == "error":
+                raise RuntimeError(f"Realtime test contractor failed: {data}")
+    return "".join(text_parts).strip()
+
+
+def _parse_realtime_result(raw_response: str, job_title: str, scenario: str) -> tuple[str, str, str]:
+    try:
+        parsed = json.loads(raw_response)
+    except json.JSONDecodeError:
+        parsed = {}
+    transcript = str(parsed.get("transcript") or raw_response).strip()
+    summary = str(parsed.get("summary") or "").strip()
+    outcome = str(parsed.get("outcome") or "").strip()
+    if transcript and summary and outcome:
+        return transcript, summary, outcome
+    fallback_transcript, fallback_summary, fallback_outcome = _scenario_result(job_title, scenario)
+    if transcript:
+        fallback_transcript = transcript
+    if summary:
+        fallback_summary = summary
+    if outcome:
+        fallback_outcome = outcome
+    return fallback_transcript, fallback_summary, fallback_outcome
 
 
 def _scenario_result(job_title: str, scenario: str) -> tuple[str, str, str]:
