@@ -149,7 +149,7 @@ def test_signed_stripe_webhook_event_updates_billing(monkeypatch, tmp_path) -> N
     import stripe
 
     from app.auth import create_user
-    from app.billing import can_use_paid_workflows, handle_stripe_event, parse_stripe_event
+    from app.billing import call_credits_remaining, can_use_paid_workflows, handle_stripe_event, parse_stripe_event
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -178,6 +178,51 @@ def test_signed_stripe_webhook_event_updates_billing(monkeypatch, tmp_path) -> N
     handle_stripe_event(event)
 
     assert can_use_paid_workflows(user_id) is True
+    assert call_credits_remaining(user_id) == 10
+
+
+def test_subscription_webhook_after_checkout_does_not_double_grant_credits(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+
+    from app.auth import create_user
+    from app.billing import call_credits_remaining, handle_stripe_event
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    user_id = create_user(email="owner@example.com", password="long-password-123", display_name="Owner")
+
+    handle_stripe_event(
+        {
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": "cs_test_123",
+                    "client_reference_id": str(user_id),
+                    "customer": "cus_test_123",
+                    "subscription": "sub_test_123",
+                    "payment_status": "paid",
+                    "metadata": {"user_id": str(user_id), "billing_mode": "test"},
+                }
+            },
+        }
+    )
+    assert call_credits_remaining(user_id) == 10
+
+    handle_stripe_event(
+        {
+            "type": "customer.subscription.updated",
+            "data": {
+                "object": {
+                    "id": "sub_test_123",
+                    "customer": "cus_test_123",
+                    "status": "active",
+                    "current_period_end": 1770000000,
+                }
+            },
+        }
+    )
+
+    assert call_credits_remaining(user_id) == 10
 
 
 def test_owner_checkout_uses_stripe_test_key_and_price(monkeypatch, tmp_path) -> None:
@@ -208,6 +253,43 @@ def test_owner_checkout_uses_stripe_test_key_and_price(monkeypatch, tmp_path) ->
 
     create_user(email="email.djhope@gmail.com", password="long-password-123", display_name="David")
     user = authenticate_user("email.djhope@gmail.com", "long-password-123")
+    assert user is not None
+
+    assert create_checkout_session(user) == "https://checkout.stripe.test/session"
+
+    assert created[0]["api_key"] == "sk_test_owner"
+    assert created[0]["line_items"] == [{"price": "price_test_base", "quantity": 1}]
+    assert created[0]["metadata"]["billing_mode"] == "test"
+
+
+def test_owner_plus_alias_checkout_uses_stripe_test_key_and_price(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_live_real")
+    monkeypatch.setenv("STRIPE_PRICE_ID", "price_live_base")
+    monkeypatch.setenv("STRIPE_TEST_SECRET_KEY", "sk_test_owner")
+    monkeypatch.setenv("STRIPE_TEST_PRICE_ID", "price_test_base")
+
+    from app.auth import create_user, authenticate_user
+    from app.billing import create_checkout_session
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    created: list[dict[str, object]] = []
+
+    class FakeCheckoutSession:
+        @staticmethod
+        def create(**kwargs):
+            created.append({"api_key": fake_stripe.api_key, **kwargs})
+            return SimpleNamespace(url="https://checkout.stripe.test/session")
+
+    fake_stripe = SimpleNamespace(
+        api_key="",
+        checkout=SimpleNamespace(Session=FakeCheckoutSession),
+    )
+    monkeypatch.setitem(sys.modules, "stripe", fake_stripe)
+
+    create_user(email="email.djhope+contractorrelief-e2e@gmail.com", password="long-password-123", display_name="David")
+    user = authenticate_user("email.djhope+contractorrelief-e2e@gmail.com", "long-password-123")
     assert user is not None
 
     assert create_checkout_session(user) == "https://checkout.stripe.test/session"

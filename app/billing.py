@@ -25,7 +25,15 @@ ACTIVE_BILLING_STATUSES = {"active", "trialing"}
 
 def _is_test_billing_user(user: sqlite3.Row) -> bool:
     settings = get_settings()
-    return str(user["email"]).strip().lower() == settings.stripe_test_owner_email.strip().lower()
+    email = str(user["email"]).strip().lower()
+    owner_email = settings.stripe_test_owner_email.strip().lower()
+    if email == owner_email:
+        return True
+    if "@" not in email or "@" not in owner_email:
+        return False
+    local, domain = email.split("@", 1)
+    owner_local, owner_domain = owner_email.split("@", 1)
+    return domain == owner_domain and local.startswith(f"{owner_local}+")
 
 
 def _stripe_config_for_user(user: sqlite3.Row, *, credit_pack: bool = False) -> tuple[str, str, str]:
@@ -237,6 +245,15 @@ def handle_stripe_event(event: Any) -> None:
             stripe_subscription_id=str(subscription_id) if subscription_id else None,
             status=status,
         )
+        if status in ACTIVE_BILLING_STATUSES:
+            settings = get_settings()
+            grant_period_call_credits(
+                int(user_id_raw),
+                period_end=f"checkout:{subscription_id or data.get('id') or 'checkout'}",
+                credits=settings.contractor_plan_call_credits,
+                active_jobs_limit=settings.contractor_plan_active_jobs,
+                leads_per_job_limit=settings.contractor_plan_leads_per_job,
+            )
         return
 
     if event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
@@ -255,13 +272,17 @@ def handle_stripe_event(event: Any) -> None:
             settings = get_settings()
             user_id = _user_id_for_customer(str(customer_id))
             if user_id is not None:
-                grant_period_call_credits(
-                    user_id,
-                    period_end=current_period_end,
-                    credits=settings.contractor_plan_call_credits,
-                    active_jobs_limit=settings.contractor_plan_active_jobs,
-                    leads_per_job_limit=settings.contractor_plan_leads_per_job,
-                )
+                subscription_id = str(data.get("id")) if data.get("id") else None
+                if subscription_id and _checkout_credit_grant_already_applied(user_id, subscription_id):
+                    _mark_credit_grant_period(user_id, current_period_end or subscription_id)
+                else:
+                    grant_period_call_credits(
+                        user_id,
+                        period_end=current_period_end or subscription_id,
+                        credits=settings.contractor_plan_call_credits,
+                        active_jobs_limit=settings.contractor_plan_active_jobs,
+                        leads_per_job_limit=settings.contractor_plan_leads_per_job,
+                    )
 
 
 def _user_id_for_customer(stripe_customer_id: str) -> int | None:
@@ -273,3 +294,23 @@ def _user_id_for_customer(stripe_customer_id: str) -> int | None:
             (stripe_customer_id,),
         ).fetchone()
         return int(row["user_id"]) if row else None
+
+
+def _checkout_credit_grant_already_applied(user_id: int, subscription_id: str) -> bool:
+    billing = get_user_billing(user_id)
+    return bool(billing and billing["last_credit_grant_period_end"] == f"checkout:{subscription_id}")
+
+
+def _mark_credit_grant_period(user_id: int, period_end: str) -> None:
+    from .db import connect
+
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE user_billing
+            SET last_credit_grant_period_end = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+            """,
+            (period_end, user_id),
+        )

@@ -10,6 +10,7 @@ from app.db import (
     delete_test_calls_for_job,
     job_for_id,
     leads_for_job,
+    list_jobs,
     next_pending_leads,
     sms_for_job,
     update_call,
@@ -172,6 +173,31 @@ def test_job_brief_updates_only_while_planning(tmp_path, monkeypatch) -> None:
 
     assert update_job_brief(job_id, "Should not overwrite") is False
     assert job_for_id(job_id)["brief"] == "New brief\nAsk about threshold."
+    get_settings.cache_clear()
+
+
+def test_user_job_listing_excludes_shared_jobs_unless_requested(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
+    get_settings.cache_clear()
+
+    from app.auth import create_user
+
+    user_id = create_user(email="owner@example.com", password="long-password-123", display_name="Owner")
+    owned_job_id = create_job(
+        title="Owned job",
+        job_type="general",
+        description="Work",
+        location="Buffalo",
+        user_id=user_id,
+    )
+
+    jobs = list_jobs(user_id)
+    assert [row["id"] for row in jobs] == [owned_job_id]
+    assert job_for_id(1, user_id) is None
+
+    jobs_with_shared = list_jobs(user_id, include_shared=True)
+    assert {row["id"] for row in jobs_with_shared} == {1, owned_job_id}
+    assert job_for_id(1, user_id, include_shared=True) is not None
     get_settings.cache_clear()
 
 

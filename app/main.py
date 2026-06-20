@@ -562,8 +562,9 @@ def contractor_dashboard(
 ) -> str:
     user = require_user(request)
     user_id = int(user["id"])
-    jobs = list_jobs(user_id)
-    selected_job = job_for_id(job_id, user_id) if job_id else (jobs[0] if jobs else None)
+    include_shared_jobs = _is_owner_user(user)
+    jobs = list_jobs(user_id, include_shared=include_shared_jobs)
+    selected_job = job_for_id(job_id, user_id, include_shared=include_shared_jobs) if job_id else (jobs[0] if jobs else None)
     selected_job_id = int(selected_job["id"]) if selected_job else None
     leads = leads_for_job(selected_job_id) if selected_job_id else []
     calls = calls_for_job(selected_job_id) if selected_job_id else []

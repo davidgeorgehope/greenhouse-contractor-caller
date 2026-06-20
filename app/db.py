@@ -542,8 +542,13 @@ def update_job_brief(
         return cur.rowcount > 0
 
 
-def list_jobs(user_id: int | None = None) -> list[sqlite3.Row]:
-    user_clause = "WHERE (jobs.user_id = ? OR jobs.user_id IS NULL)" if user_id is not None else ""
+def list_jobs(user_id: int | None = None, *, include_shared: bool = False) -> list[sqlite3.Row]:
+    if user_id is not None and include_shared:
+        user_clause = "WHERE (jobs.user_id = ? OR jobs.user_id IS NULL)"
+    elif user_id is not None:
+        user_clause = "WHERE jobs.user_id = ?"
+    else:
+        user_clause = ""
     params: tuple[object, ...] = (user_id,) if user_id is not None else ()
     with connect() as conn:
         return list(
@@ -563,8 +568,13 @@ def list_jobs(user_id: int | None = None) -> list[sqlite3.Row]:
         )
 
 
-def job_for_id(job_id: int, user_id: int | None = None) -> sqlite3.Row | None:
-    user_clause = "AND (user_id = ? OR user_id IS NULL)" if user_id is not None else ""
+def job_for_id(job_id: int, user_id: int | None = None, *, include_shared: bool = False) -> sqlite3.Row | None:
+    if user_id is not None and include_shared:
+        user_clause = "AND (user_id = ? OR user_id IS NULL)"
+    elif user_id is not None:
+        user_clause = "AND user_id = ?"
+    else:
+        user_clause = ""
     params: tuple[object, ...] = (job_id, user_id) if user_id is not None else (job_id,)
     with connect() as conn:
         return conn.execute(f"SELECT * FROM jobs WHERE id = ? {user_clause}", params).fetchone()
