@@ -137,3 +137,36 @@ def test_test_call_endpoint_is_owner_only(monkeypatch, tmp_path) -> None:
         run_test_call(FakeRequest(token), FakeBackgroundTasks(), job_id)
 
     assert exc.value.status_code == 403
+
+
+def test_test_billing_endpoint_is_owner_only(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("CONTRACTOR_AUTH_SECRET", "test-secret")
+
+    import pytest
+    from fastapi import HTTPException
+
+    from app.auth import create_session, create_user
+    from app.config import get_settings
+    from app.main import activate_test_billing
+
+    get_settings.cache_clear()
+
+    class FakeUrl:
+        scheme = "https"
+        hostname = "contractorrelief.ai"
+
+    class FakeRequest:
+        headers = {}
+        url = FakeUrl()
+
+        def __init__(self, token: str) -> None:
+            self.cookies = {"contractor_session": token}
+
+    customer_id = create_user(email="customer@example.com", password="long-password-123", display_name="Customer")
+    token, _ = create_session(customer_id)
+
+    with pytest.raises(HTTPException) as exc:
+        activate_test_billing(FakeRequest(token))
+
+    assert exc.value.status_code == 403

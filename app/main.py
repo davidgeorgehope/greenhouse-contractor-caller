@@ -52,6 +52,12 @@ from .db import (
 )
 from .discovery import discover_leads_for_job
 from .outreach import execute_outreach_actions
+from .test_harness import (
+    activate_test_subscription,
+    add_test_call_credits,
+    reset_local_test_billing,
+    simulate_test_contractor_call,
+)
 from .voice import bridge_call
 
 app = FastAPI(title="Contractor Relief")
@@ -433,7 +439,7 @@ def logout(request: Request) -> RedirectResponse:
 
 
 @app.get("/contractor/billing", response_class=HTMLResponse)
-def billing_page(request: Request, required: str = "", checkout: str = "", credits: str = "") -> str:
+def billing_page(request: Request, required: str = "", checkout: str = "", credits: str = "", test: str = "") -> str:
     user = require_user(request)
     settings = get_settings()
     billing = get_user_billing(int(user["id"]))
@@ -449,6 +455,14 @@ def billing_page(request: Request, required: str = "", checkout: str = "", credi
         notice = '<p class="notice">Credit checkout finished. Credits will appear as soon as Stripe sends the webhook.</p>'
     elif credits == "cancelled":
         notice = '<p class="error">Credit checkout was cancelled. No charge was made.</p>'
+    elif test == "activated":
+        notice = '<p class="notice">Test subscription activated for your owner account. No Stripe charge was made.</p>'
+    elif test == "credits":
+        notice = '<p class="notice">Test call credits added. No Stripe charge was made.</p>'
+    elif test == "reset":
+        notice = '<p class="notice">Local test billing reset.</p>'
+    elif test == "reset-blocked":
+        notice = '<p class="error">Billing was not reset because this account is not using local test billing IDs.</p>'
 
     button = "<p>Stripe is not configured on this server yet.</p>"
     if billing_configured() and status not in {"active", "trialing"}:
@@ -458,6 +472,16 @@ def billing_page(request: Request, required: str = "", checkout: str = "", credi
     credit_button = ""
     if credit_checkout_configured():
         credit_button = '<form method="post" action="/contractor/billing/credits"><button type="submit">Add 10 call credits</button></form>'
+    test_tools = ""
+    if _is_owner_user(user):
+        test_tools = """
+        <hr>
+        <h2>Owner test billing</h2>
+        <p>Use these to test Contractor Relief billing gates without charging a card or touching Stripe objects.</p>
+        <form method="post" action="/contractor/test/billing/activate"><button type="submit">Activate test subscription</button></form>
+        <form method="post" action="/contractor/test/billing/credits"><button type="submit">Add test call credits</button></form>
+        <form method="post" action="/contractor/test/billing/reset"><button type="submit">Reset local test billing</button></form>
+        """
     body = f"""
     {notice}
     <p>Contractor Relief finds, contacts, chases, and summarizes contractors so your home project actually moves.</p>
@@ -465,9 +489,31 @@ def billing_page(request: Request, required: str = "", checkout: str = "", credi
     <p><strong>Call credits:</strong> {call_credits_remaining(int(user["id"]))}</p>
     {button}
     {credit_button}
+    {test_tools}
     <p><a href="/contractor">Back to dashboard</a></p>
     """
     return _auth_page("Billing", body)
+
+
+@app.post("/contractor/test/billing/activate")
+def activate_test_billing(request: Request) -> RedirectResponse:
+    user = _require_owner_user(request)
+    activate_test_subscription(int(user["id"]))
+    return RedirectResponse("/contractor/billing?test=activated", status_code=303)
+
+
+@app.post("/contractor/test/billing/credits")
+def add_test_billing_credits(request: Request) -> RedirectResponse:
+    user = _require_owner_user(request)
+    add_test_call_credits(int(user["id"]))
+    return RedirectResponse("/contractor/billing?test=credits", status_code=303)
+
+
+@app.post("/contractor/test/billing/reset")
+def reset_test_billing(request: Request) -> RedirectResponse:
+    user = _require_owner_user(request)
+    reset = reset_local_test_billing(int(user["id"]))
+    return RedirectResponse(f"/contractor/billing?test={'reset' if reset else 'reset-blocked'}", status_code=303)
 
 
 @app.post("/contractor/billing/checkout")
@@ -508,6 +554,7 @@ def contractor_dashboard(
     outreach_sent: str = "",
     outreach_blocked: str = "",
     outreach_failed: str = "",
+    test_agent: str = "",
     limit: str = "",
 ) -> str:
     user = require_user(request)
@@ -650,6 +697,8 @@ def contractor_dashboard(
         agent_notice += """<p class="notice">Test call started. It will appear in call history once Twilio reports back.</p>"""
     if test_cleanup:
         agent_notice += f"""<p class="notice">Cleaned out {esc(test_cleanup)} test call{'s' if test_cleanup != '1' else ''} for this job.</p>"""
+    if test_agent:
+        agent_notice += f"""<p class="notice">Test contractor agent completed call #{esc(test_agent)}. It consumed one call credit and wrote a transcript.</p>"""
     if outreach_sent or outreach_blocked or outreach_failed:
         agent_notice += f"""<p class="notice">Follow-ups processed: {esc(outreach_sent or 0)} sent, {esc(outreach_blocked or 0)} blocked, {esc(outreach_failed or 0)} failed.</p>"""
     if limit == "jobs":
@@ -682,6 +731,9 @@ def contractor_dashboard(
             </form>
             <form method="post" action="/contractor/jobs/{selected_job_id}/test-calls/cleanup" onsubmit="return confirm('Clean out test calls and transcripts for this job? Real contractor calls will stay.');">
               <button type="submit" class="secondary">Clean test calls</button>
+            </form>
+            <form method="post" action="/contractor/jobs/{selected_job_id}/test-agent">
+              <button type="submit" class="secondary">Run test contractor</button>
             </form>
         """
 
@@ -1111,6 +1163,16 @@ def cleanup_test_calls(request: Request, job_id: int) -> RedirectResponse:
     _require_owner_user(request)
     deleted = delete_test_calls_for_job(job_id)
     return RedirectResponse(f"/contractor?job_id={job_id}&test_cleanup={deleted}", status_code=303)
+
+
+@app.post("/contractor/jobs/{job_id}/test-agent")
+def run_test_contractor_agent(request: Request, job_id: int, scenario: str = Form("available")) -> RedirectResponse:
+    user = _require_owner_user(request)
+    try:
+        call_id = simulate_test_contractor_call(job_id=job_id, user_id=int(user["id"]), scenario=scenario)
+    except RuntimeError:
+        return RedirectResponse(f"/contractor?job_id={job_id}&limit=credits", status_code=303)
+    return RedirectResponse(f"/contractor?job_id={job_id}&test_agent={call_id}", status_code=303)
 
 
 @app.post("/contractor/jobs/{job_id}/agent")
