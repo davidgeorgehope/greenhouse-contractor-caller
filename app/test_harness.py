@@ -248,13 +248,15 @@ async def _run_realtime_contractor_scenario(
             if event_type in {"response.output_text.delta", "response.text.delta"}:
                 text_parts.append(str(data.get("delta") or ""))
             elif event_type in {"response.output_text.done", "response.text.done"}:
-                text_parts.append(str(data.get("text") or ""))
+                if not text_parts:
+                    text_parts.append(str(data.get("text") or ""))
             elif event_type == "response.done":
-                output = data.get("response", {}).get("output", [])
-                for item in output if isinstance(output, list) else []:
-                    for content in item.get("content", []) if isinstance(item, dict) else []:
-                        if isinstance(content, dict) and content.get("text"):
-                            text_parts.append(str(content["text"]))
+                if not text_parts:
+                    output = data.get("response", {}).get("output", [])
+                    for item in output if isinstance(output, list) else []:
+                        for content in item.get("content", []) if isinstance(item, dict) else []:
+                            if isinstance(content, dict) and content.get("text"):
+                                text_parts.append(str(content["text"]))
                 break
             elif event_type == "error":
                 raise RuntimeError(f"Realtime test contractor failed: {data}")
@@ -262,6 +264,7 @@ async def _run_realtime_contractor_scenario(
 
 
 def _parse_realtime_result(raw_response: str, job_title: str, scenario: str) -> tuple[str, str, str]:
+    raw_response = _extract_json_object(raw_response)
     try:
         parsed = json.loads(raw_response)
     except json.JSONDecodeError:
@@ -279,6 +282,26 @@ def _parse_realtime_result(raw_response: str, job_title: str, scenario: str) -> 
     if outcome:
         fallback_outcome = outcome
     return fallback_transcript, fallback_summary, fallback_outcome
+
+
+def _extract_json_object(raw_response: str) -> str:
+    text = raw_response.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    if start == -1:
+        return text
+    decoder = json.JSONDecoder()
+    try:
+        _, end = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return text
+    return text[start : start + end]
 
 
 def _scenario_result(job_title: str, scenario: str) -> tuple[str, str, str]:

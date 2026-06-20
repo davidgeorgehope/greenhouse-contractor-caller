@@ -226,3 +226,19 @@ def test_realtime_test_contractor_agent_uses_gpt_realtime_and_consumes_credit(mo
     assert call_credits_remaining(user_id) == 9
     assert connect_calls[0][0] == "wss://api.openai.com/v1/realtime?model=gpt-realtime-2"
     assert sent_messages[0]["session"]["output_modalities"] == ["text"]
+
+
+def test_realtime_result_parser_extracts_fenced_json() -> None:
+    from app.test_harness import _parse_realtime_result
+
+    raw = '''```json
+{"transcript":"Sam: Hi\\nContractor: Send photos.","summary":"Contractor needs photos.","outcome":"conversation"}
+``````json
+{"transcript":"duplicate","summary":"duplicate","outcome":"likely_no"}
+```'''
+
+    transcript, summary, outcome = _parse_realtime_result(raw, "Greenhouse", "needs_photos")
+
+    assert transcript == "Sam: Hi\nContractor: Send photos."
+    assert summary == "Contractor needs photos."
+    assert outcome == "conversation"
