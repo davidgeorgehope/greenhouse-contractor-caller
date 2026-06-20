@@ -41,6 +41,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS signups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL DEFAULT '',
+  project_type TEXT NOT NULL DEFAULT '',
+  location TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'landing',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_signups_created_at ON signups(created_at);
+
 CREATE TABLE IF NOT EXISTS user_billing (
   user_id INTEGER PRIMARY KEY REFERENCES users(id),
   stripe_customer_id TEXT,
@@ -258,6 +272,41 @@ def create_job(*, title: str, job_type: str, description: str, location: str) ->
             (title, job_type, description, location, brief),
         )
         return int(cur.lastrowid)
+
+
+def create_signup(
+    *,
+    email: str,
+    display_name: str = "",
+    project_type: str = "",
+    location: str = "",
+    notes: str = "",
+    source: str = "landing",
+) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO signups(email, display_name, project_type, location, notes, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+              display_name=COALESCE(NULLIF(excluded.display_name, ''), signups.display_name),
+              project_type=COALESCE(NULLIF(excluded.project_type, ''), signups.project_type),
+              location=COALESCE(NULLIF(excluded.location, ''), signups.location),
+              notes=COALESCE(NULLIF(excluded.notes, ''), signups.notes),
+              source=excluded.source,
+              updated_at=CURRENT_TIMESTAMP
+            RETURNING id
+            """,
+            (
+                email.strip().lower(),
+                display_name.strip(),
+                project_type.strip(),
+                location.strip(),
+                notes.strip(),
+                source.strip() or "landing",
+            ),
+        )
+        return int(cur.fetchone()["id"])
 
 
 def get_user_billing(user_id: int) -> sqlite3.Row | None:

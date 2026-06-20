@@ -19,6 +19,7 @@ from .db import (
     create_email_message,
     create_job,
     create_outreach_action,
+    create_signup,
     create_sms_message,
     delete_test_calls_for_job,
     default_job_brief,
@@ -50,8 +51,185 @@ def health() -> dict[str, str]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def root() -> RedirectResponse:
-    return RedirectResponse("/contractor", status_code=303)
+def root() -> str:
+    return _landing_page()
+
+
+def _landing_page() -> str:
+    settings = get_settings()
+    product_name = html.escape(settings.contractor_product_name)
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{product_name} - Stop chasing contractors</title>
+  <style>
+    :root {{ --ink:#17201b; --muted:#607067; --line:#d8dfda; --bg:#f6f7f3; --band:#ffffff; --accent:#0f766e; --accent-dark:#0a524d; --warm:#f3c77b; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font:15px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }}
+    a {{ color:inherit; }}
+    .nav {{ display:flex; align-items:center; justify-content:space-between; gap:16px; max-width:1120px; margin:0 auto; padding:18px 22px; }}
+    .brand {{ font-weight:800; font-size:18px; }}
+    .nav-links {{ display:flex; gap:10px; align-items:center; }}
+    .nav-links a {{ text-decoration:none; font-weight:700; color:var(--muted); }}
+    .nav-links .button {{ color:white; background:var(--accent); padding:9px 12px; border-radius:6px; }}
+    .hero {{ background:linear-gradient(180deg,#fff 0%,#f6f7f3 100%); border-top:1px solid #eef1ed; }}
+    .hero-inner {{ max-width:1120px; margin:0 auto; padding:72px 22px 54px; display:grid; grid-template-columns:minmax(0,1.1fr) minmax(300px,.9fr); gap:42px; align-items:center; }}
+    h1 {{ margin:0; font-size:clamp(40px,6vw,72px); line-height:.96; letter-spacing:0; max-width:760px; }}
+    .lede {{ margin:20px 0 0; color:var(--muted); font-size:20px; max-width:640px; }}
+    .actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:28px; }}
+    .button-primary,.button-secondary {{ display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:11px 16px; border-radius:6px; text-decoration:none; font-weight:800; }}
+    .button-primary {{ background:var(--accent); color:white; }}
+    .button-secondary {{ border:1px solid var(--line); background:white; color:var(--ink); }}
+    .proof {{ display:grid; gap:12px; padding:0; margin:0; list-style:none; }}
+    .proof li {{ border-left:4px solid var(--warm); background:white; padding:14px 16px; color:var(--muted); box-shadow:0 1px 0 rgba(23,32,27,.05); }}
+    .proof strong {{ display:block; color:var(--ink); margin-bottom:3px; }}
+    .band {{ background:var(--band); border-block:1px solid var(--line); }}
+    .steps {{ max-width:1120px; margin:0 auto; padding:42px 22px; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:22px; }}
+    .step {{ padding:0; }}
+    .step span {{ display:inline-grid; place-items:center; width:32px; height:32px; border-radius:50%; background:#e2f2ef; color:var(--accent-dark); font-weight:900; margin-bottom:12px; }}
+    h2 {{ margin:0 0 8px; font-size:21px; letter-spacing:0; }}
+    .step p,.pricing p {{ margin:0; color:var(--muted); }}
+    .pricing {{ max-width:1120px; margin:0 auto; padding:44px 22px 60px; display:grid; grid-template-columns:minmax(0,.9fr) minmax(280px,.6fr); gap:34px; align-items:start; }}
+    .price {{ font-size:44px; font-weight:900; line-height:1; margin:8px 0; }}
+    .limits {{ margin:18px 0 0; padding:0; list-style:none; display:grid; gap:8px; color:var(--muted); }}
+    .limits li::before {{ content:""; display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--accent); margin-right:9px; vertical-align:middle; }}
+    footer {{ max-width:1120px; margin:0 auto; padding:22px; color:var(--muted); display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; }}
+    @media (max-width:760px) {{
+      .hero-inner,.pricing {{ grid-template-columns:1fr; padding-top:42px; }}
+      .steps {{ grid-template-columns:1fr; }}
+      h1 {{ font-size:42px; }}
+      .nav {{ align-items:flex-start; }}
+      .nav-links {{ flex-wrap:wrap; justify-content:flex-end; }}
+    }}
+  </style>
+</head>
+<body>
+  <nav class="nav">
+    <div class="brand">{product_name}</div>
+    <div class="nav-links">
+      <a href="/contractor/login">Sign in</a>
+      <a class="button" href="/signup">Join early access</a>
+    </div>
+  </nav>
+  <main>
+    <section class="hero">
+      <div class="hero-inner">
+        <div>
+          <h1>Stop chasing contractors.</h1>
+          <p class="lede">Send Contractor Relief the job. It finds local options, calls the best matches, follows up by text or email, and gives you the useful answers without the phone-tag misery.</p>
+          <div class="actions">
+            <a class="button-primary" href="/signup">Join early access</a>
+            <a class="button-secondary" href="/contractor/login">Open dashboard</a>
+          </div>
+        </div>
+        <ul class="proof">
+          <li><strong>Built for small home jobs</strong> Assembly, repairs, installs, cleanup, and the odd work nobody wants to quote.</li>
+          <li><strong>Calls real businesses</strong> Uses live AI voice on GPT-Realtime-2 with text and email follow-up.</li>
+          <li><strong>Keeps the blast radius sane</strong> Jobs and contractor contacts are capped so pricing can stay consumer-friendly.</li>
+        </ul>
+      </div>
+    </section>
+    <section class="band">
+      <div class="steps">
+        <div class="step"><span>1</span><h2>Describe the job</h2><p>Tell it what needs doing, where, timing, constraints, and what a useful quote looks like.</p></div>
+        <div class="step"><span>2</span><h2>It handles outreach</h2><p>Contractor Relief finds leads, places calls, sends follow-ups, and filters dead ends.</p></div>
+        <div class="step"><span>3</span><h2>You get the short list</h2><p>Review availability, rough pricing, callbacks, and next steps in one dashboard.</p></div>
+      </div>
+    </section>
+    <section class="pricing">
+      <div>
+        <h2>Launch pricing target</h2>
+        <div class="price">$10/mo</div>
+        <p>Designed for consumers, not procurement committees. Final limits may change while early users teach us where the real cost sits.</p>
+      </div>
+      <ul class="limits">
+        <li>Up to 5 active jobs</li>
+        <li>Included contractor call credits</li>
+        <li>Optional top-ups for bigger projects</li>
+        <li>Limits on contractor count and call length</li>
+      </ul>
+    </section>
+  </main>
+  <footer><span>{product_name}</span><span>Contractor coordination without the coordination headache.</span></footer>
+</body>
+</html>
+"""
+
+
+@app.get("/signup", response_class=HTMLResponse)
+def signup_form() -> str:
+    return _signup_page()
+
+
+@app.post("/signup", response_class=HTMLResponse)
+def signup(
+    email: str = Form(...),
+    display_name: str = Form(""),
+    project_type: str = Form(""),
+    location: str = Form(""),
+    notes: str = Form(""),
+) -> str:
+    create_signup(
+        email=email,
+        display_name=display_name,
+        project_type=project_type,
+        location=location,
+        notes=notes,
+    )
+    return _signup_page(success=True)
+
+
+def _signup_page(success: bool = False) -> str:
+    product_name = html.escape(get_settings().contractor_product_name)
+    success_html = (
+        '<p class="notice">You are on the early access list. We will follow up when the next batch opens.</p>'
+        if success
+        else ""
+    )
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Early access - {product_name}</title>
+  <style>
+    :root {{ --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font:15px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); padding:24px; }}
+    main {{ width:min(520px,100%); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:24px; }}
+    h1 {{ margin:0 0 8px; font-size:30px; letter-spacing:0; }}
+    p {{ color:var(--muted); margin:0 0 16px; }}
+    form {{ display:grid; gap:11px; }}
+    label {{ display:grid; gap:6px; font-weight:750; }}
+    input,textarea {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:10px; font:inherit; }}
+    textarea {{ min-height:96px; resize:vertical; }}
+    button {{ border:0; border-radius:6px; padding:11px 12px; font-weight:800; background:var(--accent); color:white; cursor:pointer; }}
+    a {{ color:var(--accent); font-weight:700; }}
+    .notice {{ color:#166534; background:#edf9ef; border:1px solid #c8e6ca; border-radius:6px; padding:9px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Join early access</h1>
+    <p>Tell us what kind of contractor chasing you want off your plate.</p>
+    {success_html}
+    <form method="post" action="/signup">
+      <label>Name <input name="display_name" autocomplete="name"></label>
+      <label>Email <input name="email" type="email" autocomplete="email" required></label>
+      <label>Project type <input name="project_type" placeholder="Greenhouse, deck repair, bathroom fan, fence..."></label>
+      <label>Location <input name="location" placeholder="City, state"></label>
+      <label>What is annoying about this job? <textarea name="notes"></textarea></label>
+      <button type="submit">Request access</button>
+    </form>
+    <p style="margin-top:16px"><a href="/">Back to overview</a></p>
+  </main>
+</body>
+</html>
+"""
 
 
 def _secure_cookie(request: Request) -> bool:
