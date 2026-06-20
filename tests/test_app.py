@@ -56,3 +56,84 @@ def test_signup_creates_account_and_captures_project_context(monkeypatch, tmp_pa
     assert row is not None
     assert row["project_type"] == "Fence repair"
     assert row["source"] == "account_signup"
+
+
+def test_dashboard_test_tools_are_owner_only(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("CONTRACTOR_AUTH_SECRET", "test-secret")
+
+    from app.auth import create_session, create_user
+    from app.config import get_settings
+    from app.db import create_job
+    from app.main import contractor_dashboard
+
+    get_settings.cache_clear()
+
+    class FakeUrl:
+        scheme = "https"
+        hostname = "contractorrelief.ai"
+
+    class FakeRequest:
+        headers = {}
+        url = FakeUrl()
+
+        def __init__(self, token: str) -> None:
+            self.cookies = {"contractor_session": token}
+
+    customer_id = create_user(email="customer@example.com", password="long-password-123", display_name="Customer")
+    customer_token, _ = create_session(customer_id)
+    create_job(title="Fence repair", job_type="fence", description="Fix fence.", location="Buffalo", user_id=customer_id)
+
+    customer_page = contractor_dashboard(FakeRequest(customer_token))
+
+    assert "Launch outreach" in customer_page
+    assert "Test call David" not in customer_page
+    assert "Clean test calls" not in customer_page
+
+    owner_id = create_user(email="email.djhope@gmail.com", password="long-password-123", display_name="David")
+    owner_token, _ = create_session(owner_id)
+    create_job(title="Greenhouse", job_type="assembly", description="Assemble greenhouse.", location="Gasport", user_id=owner_id)
+
+    owner_page = contractor_dashboard(FakeRequest(owner_token))
+
+    assert "Test call David" in owner_page
+    assert "Clean test calls" in owner_page
+
+
+def test_test_call_endpoint_is_owner_only(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("CONTRACTOR_AUTH_SECRET", "test-secret")
+
+    import pytest
+    from fastapi import HTTPException
+
+    from app.auth import create_session, create_user
+    from app.config import get_settings
+    from app.db import create_job
+    from app.main import run_test_call
+
+    get_settings.cache_clear()
+
+    class FakeUrl:
+        scheme = "https"
+        hostname = "contractorrelief.ai"
+
+    class FakeRequest:
+        headers = {}
+        url = FakeUrl()
+
+        def __init__(self, token: str) -> None:
+            self.cookies = {"contractor_session": token}
+
+    class FakeBackgroundTasks:
+        def add_task(self, *args, **kwargs) -> None:
+            raise AssertionError("Non-owner should not queue test calls")
+
+    customer_id = create_user(email="customer@example.com", password="long-password-123", display_name="Customer")
+    token, _ = create_session(customer_id)
+    job_id = create_job(title="Fence repair", job_type="fence", description="Fix fence.", location="Buffalo", user_id=customer_id)
+
+    with pytest.raises(HTTPException) as exc:
+        run_test_call(FakeRequest(token), FakeBackgroundTasks(), job_id)
+
+    assert exc.value.status_code == 403

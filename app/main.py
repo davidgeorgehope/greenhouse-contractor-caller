@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import html
 
-from fastapi import BackgroundTasks, FastAPI, Form, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, Form, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import status as http_status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .agent import run_job_agent
@@ -54,6 +55,8 @@ from .outreach import execute_outreach_actions
 from .voice import bridge_call
 
 app = FastAPI(title="Contractor Relief")
+
+OWNER_EMAIL = "email.djhope@gmail.com"
 
 
 @app.get("/greenhouse/health")
@@ -264,6 +267,21 @@ def _secure_cookie(request: Request) -> bool:
     host = (request.url.hostname or "").lower()
     local_hosts = {"127.0.0.1", "localhost", "::1"}
     return request.url.scheme == "https" or forwarded_proto == "https" or host not in local_hosts
+
+
+def _is_owner_user(user: object) -> bool:
+    try:
+        email = str(user["email"])
+    except (KeyError, TypeError):
+        return False
+    return email.strip().lower() == OWNER_EMAIL
+
+
+def _require_owner_user(request: Request):
+    user = require_user(request)
+    if not _is_owner_user(user):
+        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Owner-only tool")
+    return user
 
 
 def _auth_page(title: str, body: str, error: str = "") -> str:
@@ -656,6 +674,16 @@ def contractor_dashboard(
     paid_disabled = settings.contractor_billing_required and not billing_active
     paid_disabled_attr = "disabled" if paid_disabled else ""
     paid_disabled_notice = '<p class="warning">Billing is required before launching outreach.</p>' if paid_disabled else ""
+    owner_tools = ""
+    if _is_owner_user(user):
+        owner_tools = f"""
+            <form method="post" action="/contractor/jobs/{selected_job_id}/test-call">
+              <button type="submit" class="secondary">Test call David</button>
+            </form>
+            <form method="post" action="/contractor/jobs/{selected_job_id}/test-calls/cleanup" onsubmit="return confirm('Clean out test calls and transcripts for this job? Real contractor calls will stay.');">
+              <button type="submit" class="secondary">Clean test calls</button>
+            </form>
+        """
 
     agent_panel = (
         f"""
@@ -670,12 +698,7 @@ def contractor_dashboard(
             <form method="post" action="/contractor/jobs/{selected_job_id}/agent">
               <button type="submit" {paid_disabled_attr}>Launch outreach</button>
             </form>
-            <form method="post" action="/contractor/jobs/{selected_job_id}/test-call">
-              <button type="submit" class="secondary">Test call David</button>
-            </form>
-            <form method="post" action="/contractor/jobs/{selected_job_id}/test-calls/cleanup" onsubmit="return confirm('Clean out test calls and transcripts for this job? Real contractor calls will stay.');">
-              <button type="submit" class="secondary">Clean test calls</button>
-            </form>
+            {owner_tools}
           </div>
           {paid_disabled_notice}
           {'<p class="warning">Caller is disabled on this server, so the agent can source leads but cannot place calls until CALLER_DISABLED=0.</p>' if settings.caller_disabled else ''}
@@ -1078,14 +1101,14 @@ def run_call_loop(request: Request, background_tasks: BackgroundTasks, job_id: i
 
 @app.post("/contractor/jobs/{job_id}/test-call")
 def run_test_call(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
-    require_user(request)
+    _require_owner_user(request)
     background_tasks.add_task(place_test_call, job_id=job_id, to_number=get_settings().owner_phone)
     return RedirectResponse(f"/contractor?job_id={job_id}&test_call=started", status_code=303)
 
 
 @app.post("/contractor/jobs/{job_id}/test-calls/cleanup")
 def cleanup_test_calls(request: Request, job_id: int) -> RedirectResponse:
-    require_user(request)
+    _require_owner_user(request)
     deleted = delete_test_calls_for_job(job_id)
     return RedirectResponse(f"/contractor?job_id={job_id}&test_cleanup={deleted}", status_code=303)
 
