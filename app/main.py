@@ -14,6 +14,8 @@ from .billing import (
     can_create_paid_job,
     can_use_paid_workflows,
     create_checkout_session,
+    create_credit_checkout_session,
+    credit_checkout_configured,
     handle_stripe_event,
     parse_stripe_event,
 )
@@ -397,7 +399,7 @@ def logout(request: Request) -> RedirectResponse:
 
 
 @app.get("/contractor/billing", response_class=HTMLResponse)
-def billing_page(request: Request, required: str = "", checkout: str = "") -> str:
+def billing_page(request: Request, required: str = "", checkout: str = "", credits: str = "") -> str:
     user = require_user(request)
     settings = get_settings()
     billing = get_user_billing(int(user["id"]))
@@ -409,17 +411,26 @@ def billing_page(request: Request, required: str = "", checkout: str = "") -> st
         notice = '<p class="notice">Checkout finished. Stripe will activate this account as soon as the webhook arrives.</p>'
     elif checkout == "cancelled":
         notice = '<p class="error">Checkout was cancelled. No charge was made.</p>'
+    elif credits == "success":
+        notice = '<p class="notice">Credit checkout finished. Credits will appear as soon as Stripe sends the webhook.</p>'
+    elif credits == "cancelled":
+        notice = '<p class="error">Credit checkout was cancelled. No charge was made.</p>'
 
     button = "<p>Stripe is not configured on this server yet.</p>"
     if billing_configured() and status not in {"active", "trialing"}:
         button = '<form method="post" action="/contractor/billing/checkout"><button type="submit">Start Contractor Relief</button></form>'
     elif status in {"active", "trialing"}:
         button = '<p class="notice">Billing is active. You can launch outreach.</p>'
+    credit_button = ""
+    if credit_checkout_configured():
+        credit_button = '<form method="post" action="/contractor/billing/credits"><button type="submit">Add 10 call credits</button></form>'
     body = f"""
     {notice}
     <p>Contractor Relief finds, contacts, chases, and summarizes contractors so your home project actually moves.</p>
     <p><strong>Status:</strong> {html.escape(status)}</p>
+    <p><strong>Call credits:</strong> {call_credits_remaining(int(user["id"]))}</p>
     {button}
+    {credit_button}
     <p><a href="/contractor">Back to dashboard</a></p>
     """
     return _auth_page("Billing", body)
@@ -430,6 +441,16 @@ def start_billing_checkout(request: Request) -> RedirectResponse:
     user = require_user(request)
     try:
         checkout_url = create_checkout_session(user)
+    except RuntimeError:
+        return RedirectResponse("/contractor/billing?required=1", status_code=303)
+    return RedirectResponse(checkout_url, status_code=303)
+
+
+@app.post("/contractor/billing/credits")
+def start_credit_checkout(request: Request) -> RedirectResponse:
+    user = require_user(request)
+    try:
+        checkout_url = create_credit_checkout_session(user)
     except RuntimeError:
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
     return RedirectResponse(checkout_url, status_code=303)

@@ -107,3 +107,29 @@ def test_plan_limits_block_extra_jobs_and_leads(monkeypatch, tmp_path) -> None:
         )
 
     assert can_add_paid_lead(user_id, job_id) is False
+
+
+def test_credit_checkout_webhook_adds_call_credits(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+
+    from app.config import get_settings
+    from app.auth import create_user
+    from app.billing import call_credits_remaining, handle_stripe_event
+
+    get_settings.cache_clear()
+    user_id = create_user(email="owner@example.com", password="long-password-123", display_name="Owner")
+
+    handle_stripe_event(
+        {
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "client_reference_id": str(user_id),
+                    "payment_status": "paid",
+                    "metadata": {"purchase_type": "call_credits", "credit_amount": "10"},
+                }
+            },
+        }
+    )
+
+    assert call_credits_remaining(user_id) == 10

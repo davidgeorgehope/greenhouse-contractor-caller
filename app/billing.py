@@ -28,6 +28,11 @@ def billing_configured() -> bool:
     return bool(settings.stripe_secret_key and settings.stripe_price_id)
 
 
+def credit_checkout_configured() -> bool:
+    settings = get_settings()
+    return bool(settings.stripe_secret_key and settings.stripe_credit_price_id)
+
+
 def can_use_paid_workflows(user_id: int) -> bool:
     settings = get_settings()
     if not settings.contractor_billing_required:
@@ -101,6 +106,34 @@ def create_checkout_session(user: sqlite3.Row) -> str:
     return str(session.url)
 
 
+def create_credit_checkout_session(user: sqlite3.Row) -> str:
+    settings = get_settings()
+    if not credit_checkout_configured():
+        raise RuntimeError("Stripe credit checkout is not configured")
+
+    import stripe
+
+    stripe.api_key = settings.stripe_secret_key
+    base_url = settings.app_host.rstrip("/")
+    credit_amount = settings.contractor_credit_pack_size
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        customer_email=str(user["email"]),
+        client_reference_id=str(user["id"]),
+        line_items=[{"price": settings.stripe_credit_price_id, "quantity": 1}],
+        success_url=f"{base_url}/contractor/billing?credits=success",
+        cancel_url=f"{base_url}/contractor/billing?credits=cancelled",
+        metadata={
+            "user_id": str(user["id"]),
+            "purchase_type": "call_credits",
+            "credit_amount": str(credit_amount),
+        },
+    )
+    if not session.url:
+        raise RuntimeError("Stripe did not return a checkout URL")
+    return str(session.url)
+
+
 def parse_stripe_event(payload: bytes, signature: str | None) -> Any:
     settings = get_settings()
     if not settings.stripe_secret_key:
@@ -132,6 +165,17 @@ def handle_stripe_event(event: Any) -> None:
     if event_type == "checkout.session.completed":
         user_id_raw = data.get("client_reference_id") or data.get("metadata", {}).get("user_id")
         if not user_id_raw:
+            return
+        metadata = data.get("metadata", {})
+        if metadata.get("purchase_type") == "call_credits":
+            if data.get("payment_status") in {"paid", "no_payment_required"}:
+                from .db import add_call_credits
+
+                try:
+                    credits = int(metadata.get("credit_amount") or get_settings().contractor_credit_pack_size)
+                except (TypeError, ValueError):
+                    credits = get_settings().contractor_credit_pack_size
+                add_call_credits(int(user_id_raw), credits)
             return
         subscription_id = data.get("subscription")
         customer_id = data.get("customer")
