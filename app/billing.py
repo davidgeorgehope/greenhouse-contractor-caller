@@ -199,9 +199,19 @@ def _timestamp_to_iso(value: object) -> str | None:
         return None
 
 
+def _stripe_object_to_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "to_dict_recursive"):
+        return value.to_dict_recursive()
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return dict(value)
+
+
 def handle_stripe_event(event: Any) -> None:
     event_type = event["type"]
-    data = event["data"]["object"]
+    data = _stripe_object_to_dict(event["data"]["object"])
 
     if event_type == "checkout.session.completed":
         user_id_raw = data.get("client_reference_id") or data.get("metadata", {}).get("user_id")

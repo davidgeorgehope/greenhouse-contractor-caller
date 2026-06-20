@@ -138,6 +138,48 @@ def test_credit_checkout_webhook_adds_call_credits(monkeypatch, tmp_path) -> Non
     assert call_credits_remaining(user_id) == 10
 
 
+def test_signed_stripe_webhook_event_updates_billing(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_unused")
+    monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
+
+    import json
+    import time
+
+    import stripe
+
+    from app.auth import create_user
+    from app.billing import can_use_paid_workflows, handle_stripe_event, parse_stripe_event
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    user_id = create_user(email="owner@example.com", password="long-password-123", display_name="Owner")
+    payload = {
+        "id": "evt_test_signed",
+        "object": "event",
+        "type": "checkout.session.completed",
+        "data": {
+            "object": {
+                "id": "cs_test_signed",
+                "object": "checkout.session",
+                "client_reference_id": str(user_id),
+                "customer": "cus_test_signed",
+                "subscription": "sub_test_signed",
+                "payment_status": "paid",
+                "metadata": {"user_id": str(user_id), "billing_mode": "test"},
+            }
+        },
+    }
+    body = json.dumps(payload, separators=(",", ":"))
+    timestamp = int(time.time())
+    signature = stripe.WebhookSignature._compute_signature(f"{timestamp}.{body}", "whsec_test_secret")
+    event = parse_stripe_event(body.encode(), f"t={timestamp},v1={signature}")
+
+    handle_stripe_event(event)
+
+    assert can_use_paid_workflows(user_id) is True
+
+
 def test_owner_checkout_uses_stripe_test_key_and_price(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_live_real")
