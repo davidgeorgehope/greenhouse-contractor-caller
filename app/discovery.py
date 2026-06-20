@@ -133,7 +133,7 @@ def _irrelevant_terms_for_job(job) -> set[str]:
     if "drywall" in haystack:
         irrelevant.update({"roofing", "siding", "gutter", "concrete", "paving"})
     if "tv" in haystack or "television" in haystack or "mounting" in haystack:
-        irrelevant.update({"cell phone", "broadcast", "tv station", "provider", "spectrum"})
+        irrelevant.update({"cell phone", "broadcast", "tv station", "provider", "spectrum", "drywall repair", "drywall contractor", "sheetrock"})
     return irrelevant
 
 
@@ -196,11 +196,11 @@ def result_fit_score(job, result: SearchResult, page_text: str = "") -> tuple[in
         "localprobook.com/",
     )
     if any(host in url for host in directory_hosts):
-        score -= 18
+        score -= 70
         reasons.append("directory")
     directory_phrases = ("find contractors", "best 10", "quicklink category", "members/ql", "near me")
     if any(phrase in primary_text for phrase in directory_phrases):
-        score -= 18
+        score -= 70
         reasons.append("directory-list")
 
     return score, reasons
@@ -437,6 +437,10 @@ def discover_leads_for_job(job_id: int, query: str | None = None, user_id: int |
             if initial_score < 25 or not phones or not emails:
                 page_text = _page_text(result.url)
             fit_score, fit_reasons = result_fit_score(job, result, page_text)
+            if any(reason.startswith("irrelevant:") for reason in fit_reasons):
+                continue
+            if any(reason in {"directory", "directory-list"} for reason in fit_reasons):
+                continue
             if fit_score < 25:
                 continue
             if not phones:
