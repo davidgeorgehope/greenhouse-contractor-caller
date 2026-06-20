@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     contractor_invite_code: str = ""
     contractor_session_cookie: str = "contractor_session"
     contractor_email_ingest_secret: str = ""
+    contractor_product_name: str = "Contractor Relief"
+    contractor_billing_required: bool = False
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_price_id: str = ""
 
     owner_name: str = "Customer"
     owner_phone: str = ""

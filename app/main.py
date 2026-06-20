@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import html
 
-from fastapi import BackgroundTasks, FastAPI, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, Form, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .agent import run_job_agent
 from .auth import authenticate_user, create_session, create_user, delete_session, has_users, require_user
+from .billing import billing_configured, can_use_paid_workflows, create_checkout_session, handle_stripe_event, parse_stripe_event
 from .caller import place_calls, place_test_call
 from .config import get_settings
 from .contact import normalize_phone, resolve_lead_for_email, resolve_lead_for_phone
@@ -21,6 +22,7 @@ from .db import (
     create_sms_message,
     delete_test_calls_for_job,
     default_job_brief,
+    get_user_billing,
     job_for_id,
     leads_for_job,
     list_jobs,
@@ -39,7 +41,7 @@ from .discovery import discover_leads_for_job
 from .outreach import execute_outreach_actions
 from .voice import bridge_call
 
-app = FastAPI(title="Sam Contractor Desk")
+app = FastAPI(title="Contractor Relief")
 
 
 @app.get("/greenhouse/health")
@@ -60,6 +62,7 @@ def _secure_cookie(request: Request) -> bool:
 
 
 def _auth_page(title: str, body: str, error: str = "") -> str:
+    product_name = get_settings().contractor_product_name
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     return f"""
 <!doctype html>
@@ -67,7 +70,7 @@ def _auth_page(title: str, body: str, error: str = "") -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(title)} · Sam Contractor Desk</title>
+  <title>{html.escape(title)} · {html.escape(product_name)}</title>
   <style>
     :root {{ --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; }}
     * {{ box-sizing:border-box; }}
@@ -80,6 +83,7 @@ def _auth_page(title: str, body: str, error: str = "") -> str:
     button {{ border:0; border-radius:6px; padding:10px 12px; font-weight:700; background:var(--accent); color:white; cursor:pointer; }}
     a {{ color:var(--accent); font-weight:650; }}
     .error {{ color:#b42318; background:#fff1f0; border:1px solid #ffd0cc; border-radius:6px; padding:9px; }}
+    .notice {{ color:#166534; background:#edf9ef; border:1px solid #c8e6ca; border-radius:6px; padding:9px; }}
   </style>
 </head>
 <body><main><h1>{html.escape(title)}</h1>{error_html}{body}</main></body>
@@ -205,6 +209,53 @@ def logout(request: Request) -> RedirectResponse:
     return response
 
 
+@app.get("/contractor/billing", response_class=HTMLResponse)
+def billing_page(request: Request, required: str = "", checkout: str = "") -> str:
+    user = require_user(request)
+    settings = get_settings()
+    billing = get_user_billing(int(user["id"]))
+    status = billing["status"] if billing else "inactive"
+    notice = ""
+    if required:
+        notice = '<p class="error">Start a subscription before launching contractor outreach.</p>'
+    elif checkout == "success":
+        notice = '<p class="notice">Checkout finished. Stripe will activate this account as soon as the webhook arrives.</p>'
+    elif checkout == "cancelled":
+        notice = '<p class="error">Checkout was cancelled. No charge was made.</p>'
+
+    button = "<p>Stripe is not configured on this server yet.</p>"
+    if billing_configured() and status not in {"active", "trialing"}:
+        button = '<form method="post" action="/contractor/billing/checkout"><button type="submit">Start Contractor Relief</button></form>'
+    elif status in {"active", "trialing"}:
+        button = '<p class="notice">Billing is active. You can launch outreach.</p>'
+    body = f"""
+    {notice}
+    <p>Contractor Relief finds, contacts, chases, and summarizes contractors so your home project actually moves.</p>
+    <p><strong>Status:</strong> {html.escape(status)}</p>
+    {button}
+    <p><a href="/contractor">Back to dashboard</a></p>
+    """
+    return _auth_page("Billing", body)
+
+
+@app.post("/contractor/billing/checkout")
+def start_billing_checkout(request: Request) -> RedirectResponse:
+    user = require_user(request)
+    try:
+        checkout_url = create_checkout_session(user)
+    except RuntimeError:
+        return RedirectResponse("/contractor/billing?required=1", status_code=303)
+    return RedirectResponse(checkout_url, status_code=303)
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str | None = Header(default=None)) -> dict[str, bool]:
+    payload = await request.body()
+    event = parse_stripe_event(payload, stripe_signature)
+    handle_stripe_event(event)
+    return {"received": True}
+
+
 @app.get("/contractor", response_class=HTMLResponse)
 def contractor_dashboard(
     request: Request,
@@ -226,6 +277,9 @@ def contractor_dashboard(
     texts = sms_for_job(selected_job_id) if selected_job_id else []
     emails = emails_for_job(selected_job_id) if selected_job_id else []
     settings = get_settings()
+    billing = get_user_billing(int(user["id"]))
+    billing_status = billing["status"] if billing else "inactive"
+    billing_active = can_use_paid_workflows(int(user["id"]))
 
     def esc(value: object) -> str:
         return html.escape("" if value is None else str(value))
@@ -247,7 +301,7 @@ def contractor_dashboard(
           <td>{esc(lead['latest_call_summary'] or lead['notes'])}</td>
         </tr>"""
         for lead in leads
-    ) or """<tr><td colspan="6" class="empty">No contractors found yet. Hand the brief to Sam and discovered contractors will appear here.</td></tr>"""
+    ) or """<tr><td colspan="6" class="empty">No contractors found yet. Launch outreach and discovered contractors will appear here.</td></tr>"""
     call_rows = "".join(
         f"""<tr>
           <td>{esc(call['created_at'])}</td>
@@ -269,7 +323,7 @@ def contractor_dashboard(
           <td>{esc(action['body'] or action['notes'])}</td>
         </tr>"""
         for action in actions
-    ) or """<tr><td colspan="5" class="empty">No next actions yet. Sam will add these when a call, text, or reply needs your attention.</td></tr>"""
+    ) or """<tr><td colspan="5" class="empty">No next actions yet. Contractor Relief will add these when a call, text, or reply needs your attention.</td></tr>"""
     text_rows = "".join(
         f"""<tr>
           <td>{esc(text['created_at'])}</td>
@@ -346,25 +400,42 @@ def contractor_dashboard(
     )
     agent_notice = ""
     if agent == "started":
-        agent_notice = """<p class="notice">Sam is working this brief now. Refresh for new leads, calls, texts, and transcripts.</p>"""
+        agent_notice = """<p class="notice">Contractor Relief is working this brief now. Refresh for new leads, calls, texts, and transcripts.</p>"""
     if test_call == "started":
         agent_notice += """<p class="notice">Test call started. It will appear in call history once Twilio reports back.</p>"""
     if test_cleanup:
         agent_notice += f"""<p class="notice">Cleaned out {esc(test_cleanup)} test call{'s' if test_cleanup != '1' else ''} for this job.</p>"""
     if outreach_sent or outreach_blocked or outreach_failed:
         agent_notice += f"""<p class="notice">Follow-ups processed: {esc(outreach_sent or 0)} sent, {esc(outreach_blocked or 0)} blocked, {esc(outreach_failed or 0)} failed.</p>"""
+    billing_panel = ""
+    if settings.contractor_billing_required and not billing_active:
+        billing_panel = """
+        <section class="panel billing-panel">
+          <div>
+            <p class="eyebrow">Billing</p>
+            <h2>Start Contractor Relief</h2>
+            <p>Subscribe before launching discovery, calls, texts, and email follow-up.</p>
+          </div>
+          <a class="button-link" href="/contractor/billing">Set up billing</a>
+        </section>
+        """
+
+    paid_disabled = settings.contractor_billing_required and not billing_active
+    paid_disabled_attr = "disabled" if paid_disabled else ""
+    paid_disabled_notice = '<p class="warning">Billing is required before launching outreach.</p>' if paid_disabled else ""
+
     agent_panel = (
         f"""
         <section class="panel agent-panel">
           <div>
             <p class="eyebrow">Main workflow</p>
-            <h2>Hand the brief to Sam</h2>
-            <p>Fill in the brief, then let Sam source contractors, pick usable candidates, run outreach, and log what happened.</p>
+            <h2>Hand the brief to Contractor Relief</h2>
+            <p>Fill in the brief, then let Contractor Relief source contractors, pick usable candidates, run outreach, and log what happened.</p>
           </div>
           {agent_notice}
           <div class="agent-actions">
             <form method="post" action="/contractor/jobs/{selected_job_id}/agent">
-              <button type="submit">Hand to Sam</button>
+              <button type="submit" {paid_disabled_attr}>Launch outreach</button>
             </form>
             <form method="post" action="/contractor/jobs/{selected_job_id}/test-call">
               <button type="submit" class="secondary">Test call David</button>
@@ -373,6 +444,7 @@ def contractor_dashboard(
               <button type="submit" class="secondary">Clean test calls</button>
             </form>
           </div>
+          {paid_disabled_notice}
           {'<p class="warning">Caller is disabled on this server, so the agent can source leads but cannot place calls until CALLER_DISABLED=0.</p>' if settings.caller_disabled else ''}
         </section>
         """
@@ -394,7 +466,7 @@ def contractor_dashboard(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sam Contractor Desk</title>
+  <title>{esc(settings.contractor_product_name)}</title>
   <style>
     :root {{ color-scheme: light; --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; --accent-2:#a16207; }}
     * {{ box-sizing: border-box; }}
@@ -411,14 +483,14 @@ def contractor_dashboard(
     .stack {{ display:grid; gap:18px; min-width:0; }}
     .panel {{ padding:16px; overflow:hidden; }}
     .hero-panel {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-start; }}
-    .agent-panel {{ display:grid; grid-template-columns:1fr auto; gap:14px 18px; align-items:center; border-color:#8bbab2; background:#f7fbfa; }}
+    .agent-panel, .billing-panel {{ display:grid; grid-template-columns:1fr auto; gap:14px 18px; align-items:center; border-color:#8bbab2; background:#f7fbfa; }}
     .agent-actions {{ display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; align-items:center; }}
     .agent-actions form {{ display:block; }}
     .execute-panel {{ display:flex; justify-content:space-between; align-items:center; gap:18px; }}
     .source-form {{ grid-template-columns:1fr auto; }}
     .execute-panel p {{ margin:0; color:var(--muted); }}
-    .agent-panel p {{ margin:0; color:var(--muted); max-width:840px; }}
-    .agent-panel h2 {{ margin:2px 0 6px; font-size:22px; }}
+    .agent-panel p, .billing-panel p {{ margin:0; color:var(--muted); max-width:840px; }}
+    .agent-panel h2, .billing-panel h2 {{ margin:2px 0 6px; font-size:22px; }}
     .hero-panel h1 {{ margin:2px 0 6px; font-size:28px; line-height:1.1; }}
     .hero-panel p {{ margin:0; color:var(--muted); max-width:820px; }}
     .eyebrow {{ text-transform:uppercase; letter-spacing:.08em; font-size:11px; color:var(--accent-2) !important; font-weight:700; }}
@@ -453,7 +525,7 @@ def contractor_dashboard(
   </style>
 </head>
 <body>
-  <header><div><h1>Sam Contractor Desk</h1><span>Write the brief. Hand it to Sam. Review what happened.</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
+  <header><div><h1>{esc(settings.contractor_product_name)}</h1><span>Write the brief. Launch outreach. Review what happened. Billing: {esc(billing_status)}</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
   <main>
     <aside>
       <h2>Jobs</h2>
@@ -463,6 +535,7 @@ def contractor_dashboard(
     </aside>
     <div class="stack">
       {selected_header}
+      {billing_panel}
       {agent_panel}
       <section class="panel"><h2>Contractors found</h2><table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Status</th><th>Priority</th><th>Notes / latest result</th></tr></thead><tbody>{lead_rows}</tbody></table></section>
       <section class="panel"><h2>Call history</h2><table><thead><tr><th>When</th><th>Lead</th><th>Direction</th><th>Status</th><th>Outcome</th><th>Summary</th><th>Review</th></tr></thead><tbody>{call_rows}</tbody></table></section>
@@ -502,7 +575,7 @@ def call_detail(request: Request, call_id: int) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Call Transcript · Sam Contractor Desk</title>
+  <title>Call Transcript · Contractor Relief</title>
   <style>
     :root {{ color-scheme: light; --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; --accent-2:#a16207; }}
     * {{ box-sizing:border-box; }}
@@ -525,7 +598,7 @@ def call_detail(request: Request, call_id: int) -> str:
   </style>
 </head>
 <body>
-  <header><div><h1>Sam Contractor Desk</h1><span>Call transcript review</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
+  <header><div><h1>Contractor Relief</h1><span>Call transcript review</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
   <main>
     <a class="button-link" href="{back_href}">Back to dashboard</a>
     <section class="panel">
@@ -569,7 +642,7 @@ def new_contractor_job(request: Request) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Create Job · Sam Contractor Desk</title>
+  <title>Create Job · Contractor Relief</title>
   <style>
     :root {{ color-scheme: light; --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; --accent-2:#a16207; }}
     * {{ box-sizing:border-box; }}
@@ -596,13 +669,13 @@ def new_contractor_job(request: Request) -> str:
   </style>
 </head>
 <body>
-  <header><div><h1>Sam Contractor Desk</h1><span>Create a contractor job brief</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
+  <header><div><h1>Contractor Relief</h1><span>Create a contractor job brief</span></div><form method="post" action="/contractor/logout"><span>{esc(user['display_name'] or user['email'])}</span><button type="submit">Sign out</button></form></header>
   <main>
     <section class="panel hero-panel">
       <div>
         <p class="eyebrow">New job</p>
         <h1>Create the brief</h1>
-        <p>This is the source of truth Sam will use for search, calls, texts, emails, and follow-ups.</p>
+        <p>This is the source of truth Contractor Relief will use for search, calls, texts, emails, and follow-ups.</p>
       </div>
       <a class="button-link secondary" href="/contractor">Back</a>
     </section>
@@ -697,7 +770,9 @@ def discover_contractor_leads(
     job_id: int,
     query: str = Form(""),
 ) -> RedirectResponse:
-    require_user(request)
+    user = require_user(request)
+    if not can_use_paid_workflows(int(user["id"])):
+        return RedirectResponse("/contractor/billing?required=1", status_code=303)
     result = discover_leads_for_job(job_id, query=query)
     return RedirectResponse(
         f"/contractor?job_id={job_id}&discovered={int(result['created'])}&searched={int(result['searched'])}",
@@ -734,7 +809,9 @@ def add_contractor_followup(
 
 @app.post("/contractor/jobs/{job_id}/followups/execute")
 def execute_contractor_followups(request: Request, job_id: int) -> RedirectResponse:
-    require_user(request)
+    user = require_user(request)
+    if not can_use_paid_workflows(int(user["id"])):
+        return RedirectResponse("/contractor/billing?required=1", status_code=303)
     result = execute_outreach_actions(job_id)
     return RedirectResponse(
         f"/contractor?job_id={job_id}"
@@ -747,7 +824,9 @@ def execute_contractor_followups(request: Request, job_id: int) -> RedirectRespo
 
 @app.post("/contractor/jobs/{job_id}/call-loop")
 def run_call_loop(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
-    require_user(request)
+    user = require_user(request)
+    if not can_use_paid_workflows(int(user["id"])):
+        return RedirectResponse("/contractor/billing?required=1", status_code=303)
     background_tasks.add_task(place_calls, job_id=job_id, include_unknown_travel=True)
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
@@ -768,7 +847,9 @@ def cleanup_test_calls(request: Request, job_id: int) -> RedirectResponse:
 
 @app.post("/contractor/jobs/{job_id}/agent")
 def hand_job_to_agent(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
-    require_user(request)
+    user = require_user(request)
+    if not can_use_paid_workflows(int(user["id"])):
+        return RedirectResponse("/contractor/billing?required=1", status_code=303)
     background_tasks.add_task(run_job_agent, job_id)
     return RedirectResponse(f"/contractor?job_id={job_id}&agent=started", status_code=303)
 

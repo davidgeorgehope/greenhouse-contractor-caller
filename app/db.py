@@ -41,6 +41,18 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS user_billing (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id),
+  stripe_customer_id TEXT,
+  stripe_subscription_id TEXT,
+  status TEXT NOT NULL DEFAULT 'inactive',
+  current_period_end TEXT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_billing_customer ON user_billing(stripe_customer_id);
+CREATE INDEX IF NOT EXISTS idx_user_billing_subscription ON user_billing(stripe_subscription_id);
+
 CREATE TABLE IF NOT EXISTS leads (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER REFERENCES jobs(id),
@@ -246,6 +258,62 @@ def create_job(*, title: str, job_type: str, description: str, location: str) ->
             (title, job_type, description, location, brief),
         )
         return int(cur.lastrowid)
+
+
+def get_user_billing(user_id: int) -> sqlite3.Row | None:
+    with connect() as conn:
+        return conn.execute("SELECT * FROM user_billing WHERE user_id = ?", (user_id,)).fetchone()
+
+
+def billing_is_active(user_id: int) -> bool:
+    billing = get_user_billing(user_id)
+    return bool(billing and billing["status"] in {"active", "trialing"})
+
+
+def upsert_user_billing(
+    *,
+    user_id: int,
+    stripe_customer_id: str | None,
+    stripe_subscription_id: str | None,
+    status: str,
+    current_period_end: str | None = None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_billing(user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              stripe_customer_id=COALESCE(excluded.stripe_customer_id, user_billing.stripe_customer_id),
+              stripe_subscription_id=COALESCE(excluded.stripe_subscription_id, user_billing.stripe_subscription_id),
+              status=excluded.status,
+              current_period_end=COALESCE(excluded.current_period_end, user_billing.current_period_end),
+              updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end),
+        )
+
+
+def upsert_user_billing_by_customer(
+    *,
+    stripe_customer_id: str,
+    stripe_subscription_id: str | None,
+    status: str,
+    current_period_end: str | None = None,
+) -> bool:
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE user_billing
+            SET stripe_subscription_id=COALESCE(?, stripe_subscription_id),
+                status=?,
+                current_period_end=COALESCE(?, current_period_end),
+                updated_at=CURRENT_TIMESTAMP
+            WHERE stripe_customer_id=?
+            """,
+            (stripe_subscription_id, status, current_period_end, stripe_customer_id),
+        )
+        return cur.rowcount > 0
 
 
 def update_job_status(job_id: int, status: str) -> None:
