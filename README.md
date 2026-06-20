@@ -1,4 +1,4 @@
-# Sam Contractor Desk
+# Contractor Relief
 
 Small contractor-sourcing desk for planning home jobs, finding local contractors, and tracking calls, texts, contractor emails, and follow-up actions. The greenhouse assembly workflow is now the first job inside the app rather than the whole app.
 
@@ -7,7 +7,7 @@ It keeps this work separate from Nox Voice:
 - FastAPI app with Twilio webhook and OpenAI Realtime bridge
 - SQLite jobs, lead/call queue, contractor email addresses, SMS history, and follow-up actions
 - Invite-only dashboard registration, PBKDF2 password hashing, and server-side sessions
-- Production dashboard at `https://contractor.msg.engineer/contractor` via Cloudflare Tunnel
+- Production dashboard at `https://contractorrelief.ai/contractor` via Cloudflare Tunnel
 - Local dashboard at `http://127.0.0.1:8016/contractor`
 - Selected-job call loop execution from the dashboard, plus one-shot CLI caller via `python -m app.caller`
 - Two separate text paths so the sender is never ambiguous:
@@ -53,7 +53,7 @@ The job agent owns channel decisions after the operator has handed over the job 
 
 The dashboard routes under `/contractor` require login. Twilio webhook routes under `/greenhouse/*` remain public so callbacks continue to work.
 
-Production runs on Hetzner behind Cloudflare Tunnel. The app binds to `127.0.0.1:8005`; `contractor.msg.engineer` routes directly to that local service through the `SIGNAL_OBSERVER_001` tunnel. Do not open a firewall port for the dashboard.
+Production runs on Hetzner behind Cloudflare Tunnel. The app binds to `127.0.0.1:8005`; `contractorrelief.ai` and `www.contractorrelief.ai` route directly to that local service through the `SIGNAL_OBSERVER_001` tunnel. Do not open a firewall port for the dashboard.
 
 Required production env vars:
 
