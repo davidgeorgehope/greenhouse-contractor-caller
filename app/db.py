@@ -94,7 +94,6 @@ CREATE TABLE IF NOT EXISTS leads (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone);
 CREATE INDEX IF NOT EXISTS idx_leads_status_priority ON leads(status, priority DESC, id);
 
 CREATE TABLE IF NOT EXISTS calls (
@@ -212,11 +211,18 @@ def connect() -> sqlite3.Connection:
     _ensure_call_columns(conn)
     _ensure_user_billing_columns(conn)
     _ensure_default_job(conn)
+    _ensure_lead_indexes(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_travel ON leads(status, drive_minutes, distance_miles)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_leads_job_status_priority ON leads(job_id, status, priority DESC, id)"
     )
     return conn
+
+
+def _ensure_lead_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP INDEX IF EXISTS idx_leads_phone")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_phone_lookup ON leads(phone)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_job_phone ON leads(job_id, phone)")
 
 
 def _ensure_job_columns(conn: sqlite3.Connection) -> None:
@@ -648,7 +654,7 @@ def call_for_id(call_id: int) -> sqlite3.Row | None:
         return conn.execute(
             """
             SELECT calls.*, leads.name AS lead_name, leads.phone AS lead_phone, leads.job_id,
-              jobs.title AS job_title
+              jobs.title AS job_title, jobs.user_id AS job_user_id
             FROM calls
             JOIN leads ON leads.id = calls.lead_id
             LEFT JOIN jobs ON jobs.id = leads.job_id
@@ -753,7 +759,7 @@ def upsert_lead(
               distance_miles, drive_minutes, service_area, notes, priority, status
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'))
-            ON CONFLICT(phone) DO UPDATE SET
+            ON CONFLICT(job_id, phone) DO UPDATE SET
               job_id=COALESCE(excluded.job_id, leads.job_id),
               name=excluded.name,
               email=excluded.email,

@@ -291,6 +291,15 @@ def _require_owner_user(request: Request):
     return user
 
 
+def _require_user_job(request: Request, job_id: int):
+    user = require_user(request)
+    include_shared = _is_owner_user(user)
+    job = job_for_id(job_id, int(user["id"]), include_shared=include_shared)
+    if job is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return user, job
+
+
 def _auth_page(title: str, body: str, error: str = "") -> str:
     product_name = get_settings().contractor_product_name
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
@@ -889,6 +898,9 @@ def call_detail(request: Request, call_id: int) -> str:
         return HTMLResponse(_auth_page("Call not found", '<p><a href="/contractor">Back to dashboard</a></p>'), status_code=404)
 
     job_id = int(call["job_id"]) if call["job_id"] is not None else None
+    job_user_id = call["job_user_id"]
+    if not _is_owner_user(user) and (job_user_id is None or int(job_user_id) != int(user["id"])):
+        return HTMLResponse(_auth_page("Call not found", '<p><a href="/contractor">Back to dashboard</a></p>'), status_code=404)
     back_href = f"/contractor?job_id={job_id}" if job_id else "/contractor"
     transcript = call["transcript"] or "No transcript was captured for this call."
     return f"""
@@ -1045,7 +1057,7 @@ def create_contractor_job(
 
 @app.post("/contractor/jobs/{job_id}/status")
 def set_contractor_job_status(request: Request, job_id: int, status: str = Form(...)) -> RedirectResponse:
-    require_user(request)
+    _require_user_job(request, job_id)
     update_job_status(job_id, status)
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
@@ -1059,7 +1071,7 @@ def set_contractor_job_brief(
     location: str = Form(...),
     brief: str = Form(...),
 ) -> RedirectResponse:
-    require_user(request)
+    _require_user_job(request, job_id)
     update_job_brief(job_id, brief, title=title, description=description, location=location)
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
@@ -1076,7 +1088,7 @@ def add_contractor_lead(
     notes: str = Form(""),
     priority: int = Form(50),
 ) -> RedirectResponse:
-    user = require_user(request)
+    user, _job = _require_user_job(request, job_id)
     user_id = int(user["id"])
     if get_settings().contractor_billing_required and not can_add_paid_lead(user_id, job_id):
         return RedirectResponse(f"/contractor?job_id={job_id}&limit=leads", status_code=303)
@@ -1100,12 +1112,13 @@ def discover_contractor_leads(
     job_id: int,
     query: str = Form(""),
 ) -> RedirectResponse:
-    user = require_user(request)
-    if not can_use_paid_workflows(int(user["id"])):
+    user, _job = _require_user_job(request, job_id)
+    user_id = int(user["id"])
+    if not can_use_paid_workflows(user_id):
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
-    if not can_add_paid_lead(int(user["id"]), job_id):
+    if not can_add_paid_lead(user_id, job_id):
         return RedirectResponse(f"/contractor?job_id={job_id}&limit=leads", status_code=303)
-    result = discover_leads_for_job(job_id, query=query)
+    result = discover_leads_for_job(job_id, query=query, user_id=user_id)
     return RedirectResponse(
         f"/contractor?job_id={job_id}&discovered={int(result['created'])}&searched={int(result['searched'])}",
         status_code=303,
@@ -1114,14 +1127,14 @@ def discover_contractor_leads(
 
 @app.post("/contractor/jobs/{job_id}/leads/{lead_id}/approve")
 def approve_contractor_lead(request: Request, job_id: int, lead_id: int) -> RedirectResponse:
-    require_user(request)
+    _require_user_job(request, job_id)
     mark_job_lead_status(job_id, lead_id, "pending")
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
 
 @app.post("/contractor/jobs/{job_id}/leads/{lead_id}/skip")
 def skip_contractor_lead(request: Request, job_id: int, lead_id: int) -> RedirectResponse:
-    require_user(request)
+    _require_user_job(request, job_id)
     mark_job_lead_status(job_id, lead_id, "skipped")
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
@@ -1134,15 +1147,16 @@ def add_contractor_followup(
     body: str = Form(""),
     due_at: str = Form(""),
 ) -> RedirectResponse:
-    require_user(request)
+    _require_user_job(request, job_id)
     create_outreach_action(job_id=job_id, lead_id=None, channel=channel, body=body, due_at=due_at or None)
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
 
 @app.post("/contractor/jobs/{job_id}/followups/execute")
 def execute_contractor_followups(request: Request, job_id: int) -> RedirectResponse:
-    user = require_user(request)
-    if not can_use_paid_workflows(int(user["id"])):
+    user, _job = _require_user_job(request, job_id)
+    user_id = int(user["id"])
+    if not can_use_paid_workflows(user_id):
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
     result = execute_outreach_actions(job_id)
     return RedirectResponse(
@@ -1156,12 +1170,13 @@ def execute_contractor_followups(request: Request, job_id: int) -> RedirectRespo
 
 @app.post("/contractor/jobs/{job_id}/call-loop")
 def run_call_loop(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
-    user = require_user(request)
-    if not can_use_paid_workflows(int(user["id"])):
+    user, _job = _require_user_job(request, job_id)
+    user_id = int(user["id"])
+    if not can_use_paid_workflows(user_id):
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
-    if call_credits_remaining(int(user["id"])) <= 0:
+    if call_credits_remaining(user_id) <= 0:
         return RedirectResponse(f"/contractor?job_id={job_id}&limit=credits", status_code=303)
-    background_tasks.add_task(place_calls, job_id=job_id, include_unknown_travel=True, user_id=int(user["id"]))
+    background_tasks.add_task(place_calls, job_id=job_id, include_unknown_travel=True, user_id=user_id)
     return RedirectResponse(f"/contractor?job_id={job_id}", status_code=303)
 
 
@@ -1204,12 +1219,13 @@ async def run_realtime_test_contractor_agent(request: Request, job_id: int, scen
 
 @app.post("/contractor/jobs/{job_id}/agent")
 def hand_job_to_agent(request: Request, background_tasks: BackgroundTasks, job_id: int) -> RedirectResponse:
-    user = require_user(request)
-    if not can_use_paid_workflows(int(user["id"])):
+    user, _job = _require_user_job(request, job_id)
+    user_id = int(user["id"])
+    if not can_use_paid_workflows(user_id):
         return RedirectResponse("/contractor/billing?required=1", status_code=303)
-    if call_credits_remaining(int(user["id"])) <= 0:
+    if call_credits_remaining(user_id) <= 0:
         return RedirectResponse(f"/contractor?job_id={job_id}&limit=credits", status_code=303)
-    background_tasks.add_task(run_job_agent, job_id, int(user["id"]))
+    background_tasks.add_task(run_job_agent, job_id, user_id)
     return RedirectResponse(f"/contractor?job_id={job_id}&agent=started", status_code=303)
 
 

@@ -152,8 +152,8 @@ def _category_for_job(job) -> str:
     return job_type or "contractor"
 
 
-def discover_leads_for_job(job_id: int, query: str | None = None) -> dict[str, object]:
-    job = job_for_id(job_id)
+def discover_leads_for_job(job_id: int, query: str | None = None, user_id: int | None = None) -> dict[str, object]:
+    job = job_for_id(job_id, user_id) if user_id is not None else job_for_id(job_id)
     if job is None:
         return {"created": 0, "searched": 0, "errors": ["Job not found."], "queries": []}
 

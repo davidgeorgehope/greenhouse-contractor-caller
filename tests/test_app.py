@@ -170,3 +170,104 @@ def test_test_billing_endpoint_is_owner_only(monkeypatch, tmp_path) -> None:
         activate_test_billing(FakeRequest(token))
 
     assert exc.value.status_code == 403
+
+
+def test_job_mutations_are_scoped_to_authenticated_owner(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("CONTRACTOR_AUTH_SECRET", "test-secret")
+    monkeypatch.setenv("CONTRACTOR_BILLING_REQUIRED", "0")
+
+    import pytest
+    from fastapi import HTTPException
+
+    from app.auth import create_session, create_user
+    from app.config import get_settings
+    from app.db import create_job, job_for_id, leads_for_job
+    from app.main import add_contractor_lead, set_contractor_job_status
+
+    get_settings.cache_clear()
+
+    class FakeUrl:
+        scheme = "https"
+        hostname = "contractorrelief.ai"
+
+    class FakeRequest:
+        headers = {}
+        url = FakeUrl()
+
+        def __init__(self, token: str) -> None:
+            self.cookies = {"contractor_session": token}
+
+    alice_id = create_user(email="alice@example.com", password="long-password-123", display_name="Alice")
+    bob_id = create_user(email="bob@example.com", password="long-password-123", display_name="Bob")
+    alice_token, _ = create_session(alice_id)
+    bob_job_id = create_job(title="Bob job", job_type="door", description="Private job.", location="Buffalo", user_id=bob_id)
+
+    with pytest.raises(HTTPException) as exc:
+        set_contractor_job_status(FakeRequest(alice_token), bob_job_id, "active")
+    assert exc.value.status_code == 404
+    assert job_for_id(bob_job_id)["status"] == "planning"
+
+    with pytest.raises(HTTPException) as exc:
+        add_contractor_lead(
+            FakeRequest(alice_token),
+            bob_job_id,
+            name="Wrong lead",
+            phone="+17165550199",
+            email="",
+            category="contractor",
+            source_url="",
+            notes="",
+            priority=50,
+        )
+    assert exc.value.status_code == 404
+    assert leads_for_job(bob_job_id) == []
+
+
+def test_call_detail_is_scoped_to_call_owner(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("CONTRACTOR_AUTH_SECRET", "test-secret")
+
+    from app.auth import create_session, create_user
+    from app.config import get_settings
+    from app.db import create_call, create_job, leads_for_job, update_call, upsert_lead
+    from app.main import call_detail
+
+    get_settings.cache_clear()
+
+    class FakeUrl:
+        scheme = "https"
+        hostname = "contractorrelief.ai"
+
+    class FakeRequest:
+        headers = {}
+        url = FakeUrl()
+
+        def __init__(self, token: str) -> None:
+            self.cookies = {"contractor_session": token}
+
+    alice_id = create_user(email="alice@example.com", password="long-password-123", display_name="Alice")
+    bob_id = create_user(email="bob@example.com", password="long-password-123", display_name="Bob")
+    alice_token, _ = create_session(alice_id)
+    bob_token, _ = create_session(bob_id)
+    bob_job_id = create_job(title="Bob private job", job_type="door", description="Private job.", location="Buffalo", user_id=bob_id)
+    upsert_lead(
+        job_id=bob_job_id,
+        name="Bob Contractor",
+        phone="+17165550111",
+        email="",
+        category="contractor",
+        source_url="",
+        notes="",
+        priority=50,
+    )
+    lead_id = int(leads_for_job(bob_job_id)[0]["id"])
+    call_id = create_call(lead_id)
+    update_call(call_id, transcript="private transcript")
+
+    alice_page = call_detail(FakeRequest(alice_token), call_id)
+    bob_page = call_detail(FakeRequest(bob_token), call_id)
+
+    assert getattr(alice_page, "status_code", None) == 404
+    assert "private transcript" not in alice_page.body.decode()
+    assert "private transcript" in bob_page

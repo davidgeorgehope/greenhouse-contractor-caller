@@ -198,6 +198,33 @@ def test_user_job_listing_excludes_shared_jobs_unless_requested(tmp_path, monkey
     jobs_with_shared = list_jobs(user_id, include_shared=True)
     assert {row["id"] for row in jobs_with_shared} == {1, owned_job_id}
     assert job_for_id(1, user_id, include_shared=True) is not None
+
+
+def test_lead_phone_uniqueness_is_job_scoped(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "test.sqlite3"))
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+
+    from app.db import create_job, leads_for_job, upsert_lead
+
+    first_job = create_job(title="Door one", job_type="door", description="", location="Buffalo", user_id=1)
+    second_job = create_job(title="Door two", job_type="door", description="", location="Lockport", user_id=2)
+
+    for job_id, name in [(first_job, "Same Contractor A"), (second_job, "Same Contractor B")]:
+        upsert_lead(
+            job_id=job_id,
+            name=name,
+            phone="+17165550199",
+            email="",
+            category="contractor",
+            source_url="",
+            notes="",
+            priority=50,
+        )
+
+    assert [lead["name"] for lead in leads_for_job(first_job)] == ["Same Contractor A"]
+    assert [lead["name"] for lead in leads_for_job(second_job)] == ["Same Contractor B"]
     get_settings.cache_clear()
 
 
