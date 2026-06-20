@@ -98,7 +98,8 @@ def _irrelevant_terms_for_job(job) -> set[str]:
 
 
 def result_fit_score(job, result: SearchResult, page_text: str = "") -> tuple[int, list[str]]:
-    text = f"{result.title} {result.snippet} {page_text[:4000]}".lower()
+    primary_text = f"{result.title} {result.snippet} {result.url}".lower()
+    text = f"{primary_text} {page_text[:4000]}".lower()
     url = result.url.lower()
     score = 0
     reasons: list[str] = []
@@ -138,7 +139,7 @@ def result_fit_score(job, result: SearchResult, page_text: str = "") -> tuple[in
         reasons.append("email")
 
     for bad in _irrelevant_terms_for_job(job):
-        if bad in text:
+        if bad in primary_text:
             score -= 35
             reasons.append(f"irrelevant:{bad}")
 
