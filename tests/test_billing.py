@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 
 def test_billing_is_open_when_not_required(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
@@ -133,3 +136,77 @@ def test_credit_checkout_webhook_adds_call_credits(monkeypatch, tmp_path) -> Non
     )
 
     assert call_credits_remaining(user_id) == 10
+
+
+def test_owner_checkout_uses_stripe_test_key_and_price(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_live_real")
+    monkeypatch.setenv("STRIPE_PRICE_ID", "price_live_base")
+    monkeypatch.setenv("STRIPE_TEST_SECRET_KEY", "sk_test_owner")
+    monkeypatch.setenv("STRIPE_TEST_PRICE_ID", "price_test_base")
+
+    from app.auth import create_user, authenticate_user
+    from app.billing import create_checkout_session
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    created: list[dict[str, object]] = []
+
+    class FakeCheckoutSession:
+        @staticmethod
+        def create(**kwargs):
+            created.append({"api_key": fake_stripe.api_key, **kwargs})
+            return SimpleNamespace(url="https://checkout.stripe.test/session")
+
+    fake_stripe = SimpleNamespace(
+        api_key="",
+        checkout=SimpleNamespace(Session=FakeCheckoutSession),
+    )
+    monkeypatch.setitem(sys.modules, "stripe", fake_stripe)
+
+    create_user(email="email.djhope@gmail.com", password="long-password-123", display_name="David")
+    user = authenticate_user("email.djhope@gmail.com", "long-password-123")
+    assert user is not None
+
+    assert create_checkout_session(user) == "https://checkout.stripe.test/session"
+
+    assert created[0]["api_key"] == "sk_test_owner"
+    assert created[0]["line_items"] == [{"price": "price_test_base", "quantity": 1}]
+    assert created[0]["metadata"]["billing_mode"] == "test"
+
+
+def test_customer_checkout_uses_live_key_and_price(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_live_real")
+    monkeypatch.setenv("STRIPE_PRICE_ID", "price_live_base")
+    monkeypatch.setenv("STRIPE_TEST_SECRET_KEY", "sk_test_owner")
+    monkeypatch.setenv("STRIPE_TEST_PRICE_ID", "price_test_base")
+
+    from app.auth import create_user, authenticate_user
+    from app.billing import create_checkout_session
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    created: list[dict[str, object]] = []
+
+    class FakeCheckoutSession:
+        @staticmethod
+        def create(**kwargs):
+            created.append({"api_key": fake_stripe.api_key, **kwargs})
+            return SimpleNamespace(url="https://checkout.stripe.live/session")
+
+    fake_stripe = SimpleNamespace(
+        api_key="",
+        checkout=SimpleNamespace(Session=FakeCheckoutSession),
+    )
+    monkeypatch.setitem(sys.modules, "stripe", fake_stripe)
+
+    create_user(email="customer@example.com", password="long-password-123", display_name="Customer")
+    user = authenticate_user("customer@example.com", "long-password-123")
+    assert user is not None
+
+    assert create_checkout_session(user) == "https://checkout.stripe.live/session"
+
+    assert created[0]["api_key"] == "sk_live_real"
+    assert created[0]["line_items"] == [{"price": "price_live_base", "quantity": 1}]
+    assert created[0]["metadata"]["billing_mode"] == "live"

@@ -23,14 +23,38 @@ from .db import (
 ACTIVE_BILLING_STATUSES = {"active", "trialing"}
 
 
+def _is_test_billing_user(user: sqlite3.Row) -> bool:
+    settings = get_settings()
+    return str(user["email"]).strip().lower() == settings.stripe_test_owner_email.strip().lower()
+
+
+def _stripe_config_for_user(user: sqlite3.Row, *, credit_pack: bool = False) -> tuple[str, str, str]:
+    settings = get_settings()
+    if _is_test_billing_user(user) and settings.stripe_test_secret_key:
+        price_id = settings.stripe_test_credit_price_id if credit_pack else settings.stripe_test_price_id
+        return settings.stripe_test_secret_key, price_id, "test"
+    price_id = settings.stripe_credit_price_id if credit_pack else settings.stripe_price_id
+    return settings.stripe_secret_key, price_id, "live"
+
+
 def billing_configured() -> bool:
     settings = get_settings()
     return bool(settings.stripe_secret_key and settings.stripe_price_id)
 
 
+def billing_configured_for_user(user: sqlite3.Row) -> bool:
+    secret_key, price_id, _mode = _stripe_config_for_user(user)
+    return bool(secret_key and price_id)
+
+
 def credit_checkout_configured() -> bool:
     settings = get_settings()
     return bool(settings.stripe_secret_key and settings.stripe_credit_price_id)
+
+
+def credit_checkout_configured_for_user(user: sqlite3.Row) -> bool:
+    secret_key, price_id, _mode = _stripe_config_for_user(user, credit_pack=True)
+    return bool(secret_key and price_id)
 
 
 def can_use_paid_workflows(user_id: int) -> bool:
@@ -83,23 +107,24 @@ def reserve_call_credit(user_id: int | None) -> bool:
 
 
 def create_checkout_session(user: sqlite3.Row) -> str:
-    settings = get_settings()
-    if not billing_configured():
+    secret_key, price_id, mode = _stripe_config_for_user(user)
+    if not secret_key or not price_id:
         raise RuntimeError("Stripe billing is not configured")
     sync_default_entitlements(int(user["id"]))
 
     import stripe
 
-    stripe.api_key = settings.stripe_secret_key
+    stripe.api_key = secret_key
+    settings = get_settings()
     base_url = settings.app_host.rstrip("/")
     session = stripe.checkout.Session.create(
         mode="subscription",
         customer_email=str(user["email"]),
         client_reference_id=str(user["id"]),
-        line_items=[{"price": settings.stripe_price_id, "quantity": 1}],
+        line_items=[{"price": price_id, "quantity": 1}],
         success_url=f"{base_url}/contractor/billing?checkout=success",
         cancel_url=f"{base_url}/contractor/billing?checkout=cancelled",
-        metadata={"user_id": str(user["id"])},
+        metadata={"user_id": str(user["id"]), "billing_mode": mode},
     )
     if not session.url:
         raise RuntimeError("Stripe did not return a checkout URL")
@@ -107,26 +132,28 @@ def create_checkout_session(user: sqlite3.Row) -> str:
 
 
 def create_credit_checkout_session(user: sqlite3.Row) -> str:
-    settings = get_settings()
-    if not credit_checkout_configured():
+    secret_key, price_id, mode = _stripe_config_for_user(user, credit_pack=True)
+    if not secret_key or not price_id:
         raise RuntimeError("Stripe credit checkout is not configured")
 
     import stripe
 
-    stripe.api_key = settings.stripe_secret_key
+    stripe.api_key = secret_key
+    settings = get_settings()
     base_url = settings.app_host.rstrip("/")
     credit_amount = settings.contractor_credit_pack_size
     session = stripe.checkout.Session.create(
         mode="payment",
         customer_email=str(user["email"]),
         client_reference_id=str(user["id"]),
-        line_items=[{"price": settings.stripe_credit_price_id, "quantity": 1}],
+        line_items=[{"price": price_id, "quantity": 1}],
         success_url=f"{base_url}/contractor/billing?credits=success",
         cancel_url=f"{base_url}/contractor/billing?credits=cancelled",
         metadata={
             "user_id": str(user["id"]),
             "purchase_type": "call_credits",
             "credit_amount": str(credit_amount),
+            "billing_mode": mode,
         },
     )
     if not session.url:
@@ -141,11 +168,25 @@ def parse_stripe_event(payload: bytes, signature: str | None) -> Any:
 
     import stripe
 
-    stripe.api_key = settings.stripe_secret_key
-    if settings.stripe_webhook_secret:
+    if settings.stripe_webhook_secret or settings.stripe_test_webhook_secret:
         if not signature:
             raise ValueError("Missing Stripe signature")
-        return stripe.Webhook.construct_event(payload, signature, settings.stripe_webhook_secret)
+        last_error: Exception | None = None
+        for api_key, webhook_secret in (
+            (settings.stripe_secret_key, settings.stripe_webhook_secret),
+            (settings.stripe_test_secret_key, settings.stripe_test_webhook_secret),
+        ):
+            if not api_key or not webhook_secret:
+                continue
+            stripe.api_key = api_key
+            try:
+                return stripe.Webhook.construct_event(payload, signature, webhook_secret)
+            except Exception as exc:
+                last_error = exc
+        if last_error:
+            raise ValueError(str(last_error)) from last_error
+        raise ValueError("No Stripe webhook secret is configured")
+    stripe.api_key = settings.stripe_secret_key
     return stripe.Event.construct_from(json.loads(payload.decode("utf-8")), stripe.api_key)
 
 

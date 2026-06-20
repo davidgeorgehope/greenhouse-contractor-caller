@@ -9,14 +9,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from .agent import run_job_agent
 from .auth import authenticate_user, create_session, create_user, delete_session, has_users, require_user
 from .billing import (
-    billing_configured,
+    billing_configured_for_user,
     call_credits_remaining,
     can_add_paid_lead,
     can_create_paid_job,
     can_use_paid_workflows,
     create_checkout_session,
     create_credit_checkout_session,
-    credit_checkout_configured,
+    credit_checkout_configured_for_user,
     handle_stripe_event,
     parse_stripe_event,
 )
@@ -468,12 +468,12 @@ def billing_page(request: Request, required: str = "", checkout: str = "", credi
         notice = '<p class="error">Test billing was not activated because this account already has a non-test Stripe customer.</p>'
 
     button = "<p>Stripe is not configured on this server yet.</p>"
-    if billing_configured() and status not in {"active", "trialing"}:
+    if billing_configured_for_user(user) and status not in {"active", "trialing"}:
         button = '<form method="post" action="/contractor/billing/checkout"><button type="submit">Start Contractor Relief</button></form>'
     elif status in {"active", "trialing"}:
         button = '<p class="notice">Billing is active. You can launch outreach.</p>'
     credit_button = ""
-    if credit_checkout_configured():
+    if credit_checkout_configured_for_user(user):
         credit_button = '<form method="post" action="/contractor/billing/credits"><button type="submit">Add 10 call credits</button></form>'
     test_tools = ""
     if _is_owner_user(user):

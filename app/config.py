@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     stripe_price_id: str = ""
     stripe_credit_price_id: str = ""
+    stripe_test_owner_email: str = "email.djhope@gmail.com"
+    stripe_test_secret_key: str = ""
+    stripe_test_webhook_secret: str = ""
+    stripe_test_price_id: str = ""
+    stripe_test_credit_price_id: str = ""
     contractor_credit_pack_size: int = 10
 
     owner_name: str = "Customer"
