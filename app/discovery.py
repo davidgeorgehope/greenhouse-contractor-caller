@@ -143,10 +143,23 @@ def result_fit_score(job, result: SearchResult, page_text: str = "") -> tuple[in
             score -= 35
             reasons.append(f"irrelevant:{bad}")
 
-    directory_hosts = ("yelp.", "angi.", "thumbtack.", "homeadvisor.", "bbb.", "mapquest.", "yellowpages.")
+    directory_hosts = (
+        "yelp.",
+        "angi.",
+        "thumbtack.",
+        "homeadvisor.",
+        "bbb.",
+        "mapquest.",
+        "yellowpages.",
+        "procore.com/network",
+    )
     if any(host in url for host in directory_hosts):
-        score -= 8
+        score -= 18
         reasons.append("directory")
+    directory_phrases = ("find contractors", "best 10", "quicklink category", "members/ql", "near me")
+    if any(phrase in primary_text for phrase in directory_phrases):
+        score -= 18
+        reasons.append("directory-list")
 
     return score, reasons
 
