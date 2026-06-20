@@ -189,6 +189,7 @@ def _execute_mock_outreach(job_id: int) -> dict[str, int]:
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     email = args.email or _unique_email()
+    password_generated = not bool(args.password)
     password = args.password or f"E2E-{secrets.token_urlsafe(18)}"
     display_name = "Contractor Relief E2E"
     user_id = create_user(email=email, password=password, display_name=display_name)
@@ -267,7 +268,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "ok": True,
         "email": email,
-        "password_generated": args.password is None,
+        "password_generated": password_generated,
         "user_id": user_id,
         "stripe": stripe_result,
         "credits_before_call": credits_before,
