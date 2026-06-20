@@ -122,7 +122,7 @@ def _landing_page() -> str:
     <div class="brand">{product_name}</div>
     <div class="nav-links">
       <a href="/contractor/login">Sign in</a>
-      <a class="button" href="/signup">Join early access</a>
+      <a class="button" href="/signup">Start a job</a>
     </div>
   </nav>
   <main>
@@ -132,7 +132,7 @@ def _landing_page() -> str:
           <h1>Stop chasing contractors.</h1>
           <p class="lede">Send Contractor Relief the job. It finds local options, calls the best matches, follows up by text or email, and gives you the useful answers without the phone-tag misery.</p>
           <div class="actions">
-            <a class="button-primary" href="/signup">Join early access</a>
+            <a class="button-primary" href="/signup">Start a job</a>
             <a class="button-secondary" href="/contractor/login">Open dashboard</a>
           </div>
         </div>
@@ -158,7 +158,7 @@ def _landing_page() -> str:
       </div>
       <ul class="limits">
         <li>Up to 5 active jobs</li>
-        <li>Included contractor call credits</li>
+        <li>10 included contractor call credits</li>
         <li>Optional top-ups for bigger projects</li>
         <li>Limits on contractor count and call length</li>
       </ul>
@@ -175,38 +175,53 @@ def signup_form() -> str:
     return _signup_page()
 
 
-@app.post("/signup", response_class=HTMLResponse)
+@app.post("/signup")
 def signup(
-    email: str = Form(...),
+    request: Request,
     display_name: str = Form(""),
+    email: str = Form(...),
+    password: str = Form(...),
     project_type: str = Form(""),
     location: str = Form(""),
     notes: str = Form(""),
-) -> str:
+) -> Response:
+    if len(password) < 12:
+        return HTMLResponse(_signup_page(error="Password must be at least 12 characters."), status_code=400)
+    try:
+        user_id = create_user(email=email, password=password, display_name=display_name)
+    except Exception:
+        return HTMLResponse(_signup_page(error="That email is already registered. Sign in instead."), status_code=409)
     create_signup(
         email=email,
         display_name=display_name,
         project_type=project_type,
         location=location,
         notes=notes,
+        source="account_signup",
     )
-    return _signup_page(success=True)
+    token, expires_at = create_session(user_id)
+    response = RedirectResponse("/contractor/billing", status_code=303)
+    response.set_cookie(
+        get_settings().contractor_session_cookie,
+        token,
+        httponly=True,
+        secure=_secure_cookie(request),
+        samesite="lax",
+        expires=expires_at,
+    )
+    return response
 
 
-def _signup_page(success: bool = False) -> str:
+def _signup_page(error: str = "") -> str:
     product_name = html.escape(get_settings().contractor_product_name)
-    success_html = (
-        '<p class="notice">You are on the early access list. We will follow up when the next batch opens.</p>'
-        if success
-        else ""
-    )
+    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     return f"""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Early access - {product_name}</title>
+  <title>Start - {product_name}</title>
   <style>
     :root {{ --ink:#17201b; --muted:#647067; --line:#d7ddd8; --panel:#ffffff; --bg:#f4f6f2; --accent:#0f766e; }}
     * {{ box-sizing:border-box; }}
@@ -220,23 +235,24 @@ def _signup_page(success: bool = False) -> str:
     textarea {{ min-height:96px; resize:vertical; }}
     button {{ border:0; border-radius:6px; padding:11px 12px; font-weight:800; background:var(--accent); color:white; cursor:pointer; }}
     a {{ color:var(--accent); font-weight:700; }}
-    .notice {{ color:#166534; background:#edf9ef; border:1px solid #c8e6ca; border-radius:6px; padding:9px; }}
+    .error {{ color:#b42318; background:#fff1f0; border:1px solid #ffd0cc; border-radius:6px; padding:9px; }}
   </style>
 </head>
 <body>
   <main>
-    <h1>Join early access</h1>
-    <p>Tell us what kind of contractor chasing you want off your plate.</p>
-    {success_html}
+    <h1>Start Contractor Relief</h1>
+    <p>Create an account, then subscribe to launch contractor outreach. Early launch pricing is $10/month for 5 active jobs and 10 included call credits.</p>
+    {error_html}
     <form method="post" action="/signup">
       <label>Name <input name="display_name" autocomplete="name"></label>
       <label>Email <input name="email" type="email" autocomplete="email" required></label>
+      <label>Password <input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
       <label>Project type <input name="project_type" placeholder="Greenhouse, deck repair, bathroom fan, fence..."></label>
       <label>Location <input name="location" placeholder="City, state"></label>
       <label>What is annoying about this job? <textarea name="notes"></textarea></label>
-      <button type="submit">Request access</button>
+      <button type="submit">Create account</button>
     </form>
-    <p style="margin-top:16px"><a href="/">Back to overview</a></p>
+    <p style="margin-top:16px"><a href="/contractor/login">Already have an account?</a> · <a href="/">Back to overview</a></p>
   </main>
 </body>
 </html>
