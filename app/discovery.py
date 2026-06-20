@@ -17,6 +17,7 @@ PHONE_RE = re.compile(
     r"([2-9]\d{2})[\s.\-]*(\d{4})(?!\d)"
 )
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
+MAX_CREATED_LEADS_PER_JOB = 8
 
 
 @dataclass(frozen=True)
@@ -33,10 +34,25 @@ def discovery_queries(job) -> list[str]:
     location = str(job["location"] or "Gasport NY")
     nearby = "Gasport Lockport Niagara County Buffalo NY"
     terms = [title]
-    if "door" in f"{title} {job_type} {description}".lower():
+    haystack = f"{title} {job_type} {description}".lower()
+    if "door" in haystack:
         terms.extend(["door installer", "handyman exterior door", "carpenter"])
-    if "greenhouse" in f"{title} {job_type} {description}".lower():
+    if "greenhouse" in haystack:
         terms.extend(["greenhouse installer", "greenhouse assembly handyman", "shed gazebo assembly"])
+    if "fence" in haystack:
+        terms.extend(["fence repair", "fence contractor"])
+    if "deck" in haystack:
+        terms.extend(["deck repair", "deck contractor"])
+    if "drywall" in haystack:
+        terms.extend(["drywall repair", "handyman drywall"])
+    if "gutter" in haystack:
+        terms.extend(["gutter repair", "gutter cleaning"])
+    if "tv" in haystack or "television" in haystack or "mounting" in haystack:
+        terms.extend(["tv mounting", "home theater installation"])
+    if "dishwasher" in haystack or "appliance" in haystack:
+        terms.extend(["dishwasher installation", "appliance installation"])
+    if "junk" in haystack or "hauling" in haystack:
+        terms.extend(["junk removal", "hauling service"])
     if not terms:
         terms.append(job_type)
     seen: set[str] = set()
@@ -58,6 +74,20 @@ def _job_terms(job) -> set[str]:
         terms.update({"greenhouse", "assembly", "installer", "installation", "handyman", "shed", "gazebo"})
     if "door" in haystack:
         terms.update({"door", "carpenter", "installation", "installer", "handyman"})
+    if "fence" in haystack:
+        terms.update({"fence", "fencing", "repair", "post", "contractor"})
+    if "deck" in haystack:
+        terms.update({"deck", "decking", "repair", "boards", "railing", "contractor"})
+    if "drywall" in haystack:
+        terms.update({"drywall", "sheetrock", "patch", "paint", "repair", "handyman"})
+    if "gutter" in haystack:
+        terms.update({"gutter", "gutters", "cleaning", "repair", "roof"})
+    if "tv" in haystack or "television" in haystack or "mounting" in haystack:
+        terms.update({"tv", "television", "mounting", "installation", "installer", "home theater"})
+    if "dishwasher" in haystack or "appliance" in haystack:
+        terms.update({"dishwasher", "appliance", "installation", "installer", "plumbing"})
+    if "junk" in haystack or "hauling" in haystack:
+        terms.update({"junk", "removal", "hauling", "trash", "debris"})
     for word in re.findall(r"[a-z][a-z0-9]{3,}", haystack):
         if word not in {"contractor", "general", "need", "needs", "near", "help", "with"}:
             terms.add(word)
@@ -94,6 +124,16 @@ def _irrelevant_terms_for_job(job) -> set[str]:
                 "snow removal",
             }
         )
+    if "door" in haystack and "garage" not in haystack:
+        irrelevant.update({"garage door", "overhead door", "garage doors"})
+    if "fence" in haystack:
+        irrelevant.update({"deck", "roofing", "siding", "gutter", "garage door"})
+    if "deck" in haystack:
+        irrelevant.update({"roofing", "siding", "gutter", "fence installation only"})
+    if "drywall" in haystack:
+        irrelevant.update({"roofing", "siding", "gutter", "concrete", "paving"})
+    if "tv" in haystack or "television" in haystack or "mounting" in haystack:
+        irrelevant.update({"cell phone", "broadcast", "tv station", "provider", "spectrum"})
     return irrelevant
 
 
@@ -152,6 +192,8 @@ def result_fit_score(job, result: SearchResult, page_text: str = "") -> tuple[in
         "mapquest.",
         "yellowpages.",
         "procore.com/network",
+        "porch.com/",
+        "localprobook.com/",
     )
     if any(host in url for host in directory_hosts):
         score -= 18
@@ -171,11 +213,23 @@ def normalize_phone(value: str) -> str | None:
     return "+1" + "".join(match.groups())
 
 
+def _is_placeholder_phone(phone: str) -> bool:
+    digits = re.sub(r"\D", "", phone)
+    national = digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
+    return national in {"5555555555", "0000000000", "1111111111"} or len(set(national)) == 1
+
+
+def _is_placeholder_email(email: str) -> bool:
+    return email.lower() in {"mymail@mailservice.com", "email@example.com", "test@example.com"}
+
+
 def phones_from_text(value: str) -> list[str]:
     phones: list[str] = []
     seen: set[str] = set()
     for match in PHONE_RE.finditer(value):
         phone = "+1" + "".join(match.groups())
+        if _is_placeholder_phone(phone):
+            continue
         if phone not in seen:
             seen.add(phone)
             phones.append(phone)
@@ -187,6 +241,8 @@ def emails_from_text(value: str) -> list[str]:
     seen: set[str] = set()
     for match in EMAIL_RE.finditer(value):
         email = match.group(0).lower()
+        if _is_placeholder_email(email):
+            continue
         if email not in seen:
             seen.add(email)
             emails.append(email)
@@ -368,6 +424,8 @@ def discover_leads_for_job(job_id: int, query: str | None = None, user_id: int |
             continue
         searched += len(results)
         for result in results:
+            if created >= MAX_CREATED_LEADS_PER_JOB:
+                break
             if result.url in seen_urls:
                 continue
             seen_urls.add(result.url)

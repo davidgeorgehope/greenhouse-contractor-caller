@@ -130,6 +130,79 @@ def test_discover_leads_filters_low_fit_search_results(tmp_path, monkeypatch) ->
     get_settings.cache_clear()
 
 
+def test_exterior_door_discovery_rejects_garage_door_results(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
+    get_settings.cache_clear()
+    job_id = create_job(
+        title="Exterior door replacement",
+        job_type="door_installation",
+        description="Replace a rotted exterior side door and frame.",
+        location="Gasport, NY",
+    )
+
+    def fake_search(query: str) -> list[SearchResult]:
+        return [
+            SearchResult(
+                title="Garage Door Installation in Buffalo NY",
+                url="https://example.com/garage-door",
+                snippet="Overhead garage door installation. Call (716) 555-0188.",
+            ),
+            SearchResult(
+                title="The Upgrade Guy Buffalo Handyman",
+                url="https://example.com/exterior-door",
+                snippet="Exterior door replacement and carpentry. Call (716) 555-0199.",
+            ),
+        ]
+
+    monkeypatch.setattr("app.discovery.search_contractors", fake_search)
+    monkeypatch.setattr("app.discovery._page_text", lambda url: "")
+    monkeypatch.setattr("app.discovery.travel_from_gasport", lambda address: None)
+
+    result = discover_leads_for_job(job_id, query="exterior door replacement Gasport NY")
+    leads = leads_for_job(job_id)
+
+    assert result["created"] == 1
+    assert leads[0]["name"] == "The Upgrade Guy Buffalo Handyman"
+    get_settings.cache_clear()
+
+
+def test_discovery_rejects_placeholder_contact_details(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
+    get_settings.cache_clear()
+    job_id = create_job(
+        title="Deck board replacement",
+        job_type="deck_repair",
+        description="Replace damaged deck boards.",
+        location="Gasport, NY",
+    )
+
+    def fake_search(query: str) -> list[SearchResult]:
+        return [
+            SearchResult(
+                title="Deck Repair Example",
+                url="https://example.com/bad-deck",
+                snippet="Deck repair near Buffalo. Call (555) 555-5555 or email mymail@mailservice.com.",
+            ),
+            SearchResult(
+                title="Buffalo Deck Repair",
+                url="https://example.com/good-deck",
+                snippet="Deck repair near Buffalo. Call (716) 555-0199 or email quotes@example.com.",
+            ),
+        ]
+
+    monkeypatch.setattr("app.discovery.search_contractors", fake_search)
+    monkeypatch.setattr("app.discovery._page_text", lambda url: "")
+    monkeypatch.setattr("app.discovery.travel_from_gasport", lambda address: None)
+
+    result = discover_leads_for_job(job_id, query="deck repair Gasport NY")
+    leads = leads_for_job(job_id)
+
+    assert result["created"] == 1
+    assert leads[0]["name"] == "Buffalo Deck Repair"
+    assert leads[0]["phone"] == "+17165550199"
+    get_settings.cache_clear()
+
+
 def test_search_contractors_falls_back_when_gemini_errors(monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
     get_settings.cache_clear()
