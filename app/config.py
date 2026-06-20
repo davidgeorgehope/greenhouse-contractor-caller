@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     openai_realtime_model: str = "gpt-realtime-2"
     openai_realtime_voice: str = "marin"
     brave_search_api_key: str = ""
+    gemini_api_key: str = ""
+    gemini_search_model: str = "gemini-2.5-flash"
     discovery_results_per_query: int = 6
 
     smtp_host: str = ""

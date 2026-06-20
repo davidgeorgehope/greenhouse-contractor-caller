@@ -224,6 +224,70 @@ def _brave_search(query: str) -> list[SearchResult]:
     ]
 
 
+def _extract_json_array(value: str) -> list[object]:
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        start = value.find("[")
+        end = value.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        try:
+            data = json.loads(value[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+    return data if isinstance(data, list) else []
+
+
+def _gemini_grounded_search(query: str) -> list[SearchResult]:
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        return []
+    prompt = (
+        "Find local or clearly relevant contractor businesses for this home-service job search. "
+        "Prefer individual business pages over directories. Return only a JSON array of objects "
+        "with title, url, and snippet. Include no markdown. Search query: "
+        f"{query}"
+    )
+    model = urllib.parse.quote(settings.gemini_search_model, safe="")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.gemini_api_key}"
+    payload = json.dumps(
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "response_mime_type": "application/json",
+            },
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.loads(response.read(1_000_000).decode("utf-8", errors="ignore"))
+    text_parts: list[str] = []
+    for candidate in data.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            if part.get("text"):
+                text_parts.append(str(part["text"]))
+    results: list[SearchResult] = []
+    for item in _extract_json_array("\n".join(text_parts)):
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        results.append(
+            SearchResult(
+                title=str(item.get("title") or ""),
+                url=str(item.get("url") or ""),
+                snippet=str(item.get("snippet") or ""),
+            )
+        )
+    return results[: settings.discovery_results_per_query]
+
+
 def _duckduckgo_search(query: str) -> list[SearchResult]:
     params = urllib.parse.urlencode({"q": query})
     payload = _open_url(f"https://duckduckgo.com/html/?{params}")
@@ -246,10 +310,24 @@ def _duckduckgo_search(query: str) -> list[SearchResult]:
 
 
 def search_contractors(query: str) -> list[SearchResult]:
+    settings = get_settings()
+    results: list[SearchResult] = []
+    if settings.gemini_api_key:
+        results.extend(_gemini_grounded_search(query))
     brave_results = _brave_search(query)
     if brave_results:
-        return brave_results
-    return _duckduckgo_search(query)
+        results.extend(brave_results)
+    if not results:
+        results.extend(_duckduckgo_search(query))
+    deduped: list[SearchResult] = []
+    seen: set[str] = set()
+    for result in results:
+        key = result.url.rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(result)
+    return deduped
 
 
 def _page_text(url: str) -> str:
