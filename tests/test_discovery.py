@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.config import get_settings
 from app.db import create_job, leads_for_job
-from app.discovery import SearchResult, discover_leads_for_job, discovery_queries, normalize_phone, result_fit_score
+from app.discovery import SearchResult, discover_leads_for_job, discovery_queries, normalize_phone, result_fit_score, search_contractors
 
 
 def test_discovery_queries_follow_job_shape(tmp_path, monkeypatch) -> None:
@@ -127,4 +127,30 @@ def test_discover_leads_filters_low_fit_search_results(tmp_path, monkeypatch) ->
     assert leads[0]["name"] == "WNY Handyman Assembly"
     assert leads[0]["phone"] == "+17165550199"
     assert "Garage" not in leads[0]["name"]
+    get_settings.cache_clear()
+
+
+def test_search_contractors_falls_back_when_gemini_errors(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    get_settings.cache_clear()
+
+    def broken_gemini(query: str) -> list[SearchResult]:
+        raise RuntimeError("Gemini rejected grounded JSON mode")
+
+    monkeypatch.setattr("app.discovery._gemini_grounded_search", broken_gemini)
+    monkeypatch.setattr(
+        "app.discovery._brave_search",
+        lambda query: [
+            SearchResult(
+                title="WNY Handyman Assembly",
+                url="https://example.com/handyman",
+                snippet="Greenhouse and gazebo assembly near Buffalo. Call (716) 555-0199.",
+            )
+        ],
+    )
+    monkeypatch.setattr("app.discovery._duckduckgo_search", lambda query: [])
+
+    results = search_contractors("greenhouse assembly Gasport NY")
+
+    assert [result.title for result in results] == ["WNY Handyman Assembly"]
     get_settings.cache_clear()

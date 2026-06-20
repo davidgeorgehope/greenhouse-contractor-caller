@@ -257,7 +257,6 @@ def _gemini_grounded_search(query: str) -> list[SearchResult]:
             "tools": [{"google_search": {}}],
             "generationConfig": {
                 "temperature": 0.2,
-                "response_mime_type": "application/json",
             },
         }
     ).encode("utf-8")
@@ -313,7 +312,10 @@ def search_contractors(query: str) -> list[SearchResult]:
     settings = get_settings()
     results: list[SearchResult] = []
     if settings.gemini_api_key:
-        results.extend(_gemini_grounded_search(query))
+        try:
+            results.extend(_gemini_grounded_search(query))
+        except Exception:
+            pass
     brave_results = _brave_search(query)
     if brave_results:
         results.extend(brave_results)
