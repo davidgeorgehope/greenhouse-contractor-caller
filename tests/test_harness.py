@@ -16,7 +16,7 @@ def test_local_test_billing_activation_and_reset(monkeypatch, tmp_path) -> None:
 
     assert can_use_paid_workflows(user_id) is False
 
-    activate_test_subscription(user_id)
+    assert activate_test_subscription(user_id) is True
 
     billing = get_user_billing(user_id)
     assert billing is not None
@@ -53,6 +53,29 @@ def test_reset_refuses_non_test_billing(monkeypatch, tmp_path) -> None:
     assert get_user_billing(user_id)["status"] == "active"
 
 
+def test_activate_test_billing_refuses_real_stripe_customer(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+
+    from app.auth import create_user
+    from app.config import get_settings
+    from app.db import get_user_billing, upsert_user_billing
+    from app.test_harness import activate_test_subscription
+
+    get_settings.cache_clear()
+    user_id = create_user(email="owner@example.com", password="long-password-123", display_name="Owner")
+    upsert_user_billing(
+        user_id=user_id,
+        stripe_customer_id="cus_live_real",
+        stripe_subscription_id="sub_live_real",
+        status="active",
+    )
+
+    assert activate_test_subscription(user_id) is False
+    billing = get_user_billing(user_id)
+    assert billing["stripe_customer_id"] == "cus_live_real"
+    assert billing["stripe_subscription_id"] == "sub_live_real"
+
+
 def test_test_contractor_agent_consumes_credit_and_writes_call(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
     monkeypatch.setenv("CONTRACTOR_BILLING_REQUIRED", "1")
@@ -65,7 +88,7 @@ def test_test_contractor_agent_consumes_credit_and_writes_call(monkeypatch, tmp_
 
     get_settings.cache_clear()
     user_id = create_user(email="owner@example.com", password="long-password-123", display_name="Owner")
-    activate_test_subscription(user_id)
+    assert activate_test_subscription(user_id) is True
     job_id = create_job(
         title="Greenhouse assembly",
         job_type="assembly",

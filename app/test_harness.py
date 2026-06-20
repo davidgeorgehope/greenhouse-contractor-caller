@@ -23,8 +23,13 @@ TEST_CUSTOMER_PREFIX = "cus_test_local_"
 TEST_SUBSCRIPTION_PREFIX = "sub_test_local_"
 
 
-def activate_test_subscription(user_id: int) -> None:
+def activate_test_subscription(user_id: int) -> bool:
     settings = get_settings()
+    with connect() as conn:
+        billing = conn.execute("SELECT * FROM user_billing WHERE user_id = ?", (user_id,)).fetchone()
+        existing_customer = str(billing["stripe_customer_id"] or "") if billing else ""
+        if existing_customer and not existing_customer.startswith(TEST_CUSTOMER_PREFIX):
+            return False
     upsert_user_billing(
         user_id=user_id,
         stripe_customer_id=f"{TEST_CUSTOMER_PREFIX}{user_id}",
@@ -39,6 +44,7 @@ def activate_test_subscription(user_id: int) -> None:
         active_jobs_limit=settings.contractor_plan_active_jobs,
         leads_per_job_limit=settings.contractor_plan_leads_per_job,
     )
+    return True
 
 
 def add_test_call_credits(user_id: int, credits: int | None = None) -> int:

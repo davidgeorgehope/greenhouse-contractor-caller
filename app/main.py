@@ -463,6 +463,8 @@ def billing_page(request: Request, required: str = "", checkout: str = "", credi
         notice = '<p class="notice">Local test billing reset.</p>'
     elif test == "reset-blocked":
         notice = '<p class="error">Billing was not reset because this account is not using local test billing IDs.</p>'
+    elif test == "activate-blocked":
+        notice = '<p class="error">Test billing was not activated because this account already has a non-test Stripe customer.</p>'
 
     button = "<p>Stripe is not configured on this server yet.</p>"
     if billing_configured() and status not in {"active", "trialing"}:
@@ -498,8 +500,8 @@ def billing_page(request: Request, required: str = "", checkout: str = "", credi
 @app.post("/contractor/test/billing/activate")
 def activate_test_billing(request: Request) -> RedirectResponse:
     user = _require_owner_user(request)
-    activate_test_subscription(int(user["id"]))
-    return RedirectResponse("/contractor/billing?test=activated", status_code=303)
+    activated = activate_test_subscription(int(user["id"]))
+    return RedirectResponse(f"/contractor/billing?test={'activated' if activated else 'activate-blocked'}", status_code=303)
 
 
 @app.post("/contractor/test/billing/credits")
