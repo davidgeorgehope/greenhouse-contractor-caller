@@ -86,6 +86,53 @@ def test_cloudflare_only_email_config_sends_via_cloudflare(monkeypatch, tmp_path
     get_settings.cache_clear()
 
 
+def test_smtp_config_takes_precedence_over_cloudflare(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
+    monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("SMTP_FROM", "Sam <email.djhope@gmail.com>")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    monkeypatch.setenv("CLOUDFLARE_EMAIL_TOKEN", "token")
+    monkeypatch.setenv("CLOUDFLARE_EMAIL_FROM", "Sam <contractors@example.com>")
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.delenv("RESEND_FROM", raising=False)
+    get_settings.cache_clear()
+
+    cloudflare_calls: list[str] = []
+    smtp_messages: list[tuple[str, str, str]] = []
+
+    class FakeSmtp:
+        def __init__(self, host: str, port: int, timeout: int) -> None:
+            smtp_messages.append((host, str(port), str(timeout)))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def starttls(self) -> None:
+            return None
+
+        def login(self, username: str, password: str) -> None:
+            return None
+
+        def send_message(self, message) -> None:
+            smtp_messages.append((message["From"], message["To"], message["Subject"]))
+
+    monkeypatch.setattr("app.emailer.smtplib.SMTP", FakeSmtp)
+    monkeypatch.setattr(
+        "app.emailer._send_cloudflare",
+        lambda *args: cloudflare_calls.append("called") or "cloudflare:test",
+    )
+
+    receipt = send_email("quotes@example.com", "Subject: Door fitting\n\nCan you quote this?")
+
+    assert receipt == "smtp:quotes@example.com"
+    assert cloudflare_calls == []
+    assert smtp_messages[-1] == ("Sam <email.djhope@gmail.com>", "quotes@example.com", "Door fitting")
+    get_settings.cache_clear()
+
+
 def test_execute_text_outreach(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
     get_settings.cache_clear()

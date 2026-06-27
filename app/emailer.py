@@ -24,25 +24,16 @@ def send_email(to_email: str, body: str) -> str:
     sender = (
         settings.resend_from
         if settings.resend_api_key and settings.resend_from
+        else settings.smtp_from
+        if settings.smtp_host and settings.smtp_from
         else settings.cloudflare_email_from
         if settings.cloudflare_account_id and settings.cloudflare_email_token and settings.cloudflare_email_from
-        else settings.smtp_from
+        else ""
     )
     subject, message_body = split_subject_body(body)
     if settings.resend_api_key and settings.resend_from:
         receipt = _send_resend(to_email, body, settings.resend_api_key, settings.resend_from)
-    elif settings.cloudflare_account_id and settings.cloudflare_email_token and settings.cloudflare_email_from:
-        receipt = _send_cloudflare(
-            to_email,
-            body,
-            settings.cloudflare_account_id,
-            settings.cloudflare_email_token,
-            settings.cloudflare_email_from,
-        )
-    else:
-        if not settings.smtp_host or not settings.smtp_from:
-            raise RuntimeError("Missing email sender settings")
-
+    elif settings.smtp_host and settings.smtp_from:
         message = EmailMessage()
         message["To"] = to_email
         message["From"] = settings.smtp_from
@@ -57,6 +48,16 @@ def send_email(to_email: str, body: str) -> str:
             smtp.send_message(message)
 
         receipt = message["Message-ID"] or f"smtp:{to_email}"
+    elif settings.cloudflare_account_id and settings.cloudflare_email_token and settings.cloudflare_email_from:
+        receipt = _send_cloudflare(
+            to_email,
+            body,
+            settings.cloudflare_account_id,
+            settings.cloudflare_email_token,
+            settings.cloudflare_email_from,
+        )
+    else:
+        raise RuntimeError("Missing email sender settings")
 
     create_email_message(
         direction="outbound",
