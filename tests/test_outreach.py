@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.config import get_settings
 from app.db import create_job, create_outreach_action, outreach_for_job, upsert_lead
+from app.emailer import send_email
 from app.emailer import _sender_value, split_subject_body
 from app.outreach import execute_outreach_actions
 
@@ -48,6 +49,28 @@ def test_execute_email_outreach(monkeypatch, tmp_path) -> None:
     assert sent == [("quotes@example.com", "Subject: Door fitting\n\nCan you quote this?")]
     assert actions[0]["status"] == "sent"
     get_settings.cache_clear()
+
+
+def test_cloudflare_only_email_config_blocks_cleanly(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    monkeypatch.setenv("CLOUDFLARE_EMAIL_TOKEN", "token")
+    monkeypatch.setenv("CLOUDFLARE_EMAIL_FROM", "Sam <contractors@example.com>")
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.delenv("RESEND_FROM", raising=False)
+    monkeypatch.delenv("SMTP_HOST", raising=False)
+    monkeypatch.delenv("SMTP_FROM", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        send_email("quotes@example.com", "Subject: Door fitting\n\nCan you quote this?")
+    except RuntimeError as exc:
+        assert "No outbound email provider configured" in str(exc)
+        assert "Cloudflare Email Routing is inbound-only" in str(exc)
+    else:
+        raise AssertionError("Cloudflare-only email config should not attempt outbound delivery")
+    finally:
+        get_settings.cache_clear()
 
 
 def test_execute_text_outreach(monkeypatch, tmp_path) -> None:

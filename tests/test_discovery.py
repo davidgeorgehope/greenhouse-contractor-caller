@@ -17,8 +17,53 @@ def test_discovery_queries_follow_job_shape(tmp_path, monkeypatch) -> None:
 
     queries = discovery_queries(__import__("app.db").db.job_for_id(job_id))
 
-    assert any("door installer" in query for query in queries)
+    assert any("exterior door replacement" in query for query in queries)
     assert all("Gasport" in query or "Gasport" in query for query in queries)
+    get_settings.cache_clear()
+
+
+def test_discovery_queries_prioritize_service_terms_for_common_jobs(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
+    get_settings.cache_clear()
+
+    cases = [
+        (
+            "Dishwasher installation",
+            "appliance_installation",
+            "Install a replacement built-in dishwasher.",
+            "dishwasher installation Gasport Lockport",
+            "contractor",
+        ),
+        (
+            "TV wall mounting",
+            "tv_mounting",
+            "Mount a 55 inch TV on drywall.",
+            "tv mounting Gasport Lockport",
+            "contractor",
+        ),
+        (
+            "Junk removal from garage",
+            "junk_removal",
+            "Remove old furniture and garage junk.",
+            "junk removal Gasport Lockport",
+            "contractor",
+        ),
+        (
+            "Fence post repair",
+            "fence_repair",
+            "Repair leaning wooden fence posts.",
+            "fence repair contractor Gasport Lockport",
+            "",
+        ),
+    ]
+
+    for title, job_type, description, expected_start, unwanted in cases:
+        job_id = create_job(title=title, job_type=job_type, description=description, location="Gasport, NY")
+        first_query = discovery_queries(__import__("app.db").db.job_for_id(job_id))[0]
+        assert first_query.startswith(expected_start)
+        if unwanted:
+            assert unwanted not in first_query
+
     get_settings.cache_clear()
 
 
@@ -166,6 +211,45 @@ def test_exterior_door_discovery_rejects_garage_door_results(tmp_path, monkeypat
     get_settings.cache_clear()
 
 
+def test_discovery_rejects_job_board_results(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
+    get_settings.cache_clear()
+    job_id = create_job(
+        title="Interior door fitting",
+        job_type="door_installation",
+        description="Fit and hang an interior door.",
+        location="Gasport, NY",
+    )
+
+    def fake_search(query: str) -> list[SearchResult]:
+        return [
+            SearchResult(
+                title="Niagara County, NY",
+                url="https://www.niagaracounty.gov/worksource_one/job_seeker/hot_jobs.php",
+                snippet=(
+                    "To apply, contact the employer by telephone or email. "
+                    "Carpenter job opening in Lockport. Call 716-555-0188 or email employer@example.com."
+                ),
+            ),
+            SearchResult(
+                title="WNY Door Handyman",
+                url="https://example.com/door-handyman",
+                snippet="Interior door installation and handyman carpentry near Buffalo. Call (716) 555-0199.",
+            ),
+        ]
+
+    monkeypatch.setattr("app.discovery.search_contractors", fake_search)
+    monkeypatch.setattr("app.discovery._page_text", lambda url: "")
+    monkeypatch.setattr("app.discovery.travel_from_gasport", lambda address: None)
+
+    result = discover_leads_for_job(job_id, query="carpenter contractor Gasport NY")
+    leads = leads_for_job(job_id)
+
+    assert result["created"] == 1
+    assert leads[0]["name"] == "WNY Door Handyman"
+    get_settings.cache_clear()
+
+
 def test_discovery_rejects_placeholder_contact_details(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
     get_settings.cache_clear()
@@ -226,4 +310,43 @@ def test_search_contractors_falls_back_when_gemini_errors(monkeypatch) -> None:
     results = search_contractors("greenhouse assembly Gasport NY")
 
     assert [result.title for result in results] == ["WNY Handyman Assembly"]
+    get_settings.cache_clear()
+
+
+def test_search_contractors_falls_back_when_brave_errors(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "test-brave")
+    get_settings.cache_clear()
+
+    def broken_brave(query: str) -> list[SearchResult]:
+        raise RuntimeError("Brave rate limited")
+
+    monkeypatch.setattr("app.discovery._brave_search", broken_brave)
+    monkeypatch.setattr(
+        "app.discovery._duckduckgo_search",
+        lambda query: [
+            SearchResult(
+                title="Buffalo Deck Repair",
+                url="https://example.com/deck",
+                snippet="Deck repair near Buffalo. Call (716) 555-0199.",
+            )
+        ],
+    )
+
+    results = search_contractors("deck repair Gasport NY")
+
+    assert [result.title for result in results] == ["Buffalo Deck Repair"]
+    get_settings.cache_clear()
+
+
+def test_search_contractors_returns_empty_when_all_providers_error(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "test-brave")
+    get_settings.cache_clear()
+
+    monkeypatch.setattr("app.discovery._gemini_grounded_search", lambda query: (_ for _ in ()).throw(RuntimeError("gemini down")))
+    monkeypatch.setattr("app.discovery._brave_search", lambda query: (_ for _ in ()).throw(RuntimeError("brave down")))
+    monkeypatch.setattr("app.discovery._duckduckgo_search", lambda query: (_ for _ in ()).throw(RuntimeError("ddg down")))
+
+    assert search_contractors("deck repair Gasport NY") == []
     get_settings.cache_clear()

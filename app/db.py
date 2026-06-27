@@ -987,6 +987,27 @@ def create_sms_message(
         return int(cur.lastrowid)
 
 
+def update_sms_message_status(twilio_sid: str, status: str, raw_payload: dict[str, Any] | None = None) -> None:
+    if not twilio_sid:
+        return
+    with connect() as conn:
+        if raw_payload is None:
+            conn.execute(
+                "UPDATE sms_messages SET status = ? WHERE twilio_sid = ?",
+                (status, twilio_sid),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE sms_messages
+                   SET status = ?,
+                       raw_payload_json = ?
+                 WHERE twilio_sid = ?
+                """,
+                (status, json.dumps(raw_payload, sort_keys=True), twilio_sid),
+            )
+
+
 def sms_for_job(job_id: int, limit: int = 50) -> list[sqlite3.Row]:
     with connect() as conn:
         return list(

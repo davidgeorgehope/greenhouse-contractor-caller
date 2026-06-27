@@ -33,32 +33,48 @@ def discovery_queries(job) -> list[str]:
     description = str(job["description"] or "")
     location = str(job["location"] or "Gasport NY")
     nearby = "Gasport Lockport Niagara County Buffalo NY"
-    terms = [title]
+    terms: list[str] = []
     haystack = f"{title} {job_type} {description}".lower()
     if "door" in haystack:
-        terms.extend(["door installer", "handyman exterior door", "carpenter"])
+        if "garage" in haystack:
+            terms.extend(["garage door repair", "garage door installation"])
+        else:
+            terms.extend(["exterior door replacement", "entry door installation", "handyman exterior door", "carpenter"])
     if "greenhouse" in haystack:
         terms.extend(["greenhouse installer", "greenhouse assembly handyman", "shed gazebo assembly"])
     if "fence" in haystack:
         terms.extend(["fence repair", "fence contractor"])
     if "deck" in haystack:
         terms.extend(["deck repair", "deck contractor"])
+    if "tv" in haystack or "television" in haystack or "mounting" in haystack:
+        terms.extend(["tv mounting", "home theater installation"])
     if "drywall" in haystack:
         terms.extend(["drywall repair", "handyman drywall"])
     if "gutter" in haystack:
         terms.extend(["gutter repair", "gutter cleaning"])
-    if "tv" in haystack or "television" in haystack or "mounting" in haystack:
-        terms.extend(["tv mounting", "home theater installation"])
     if "dishwasher" in haystack or "appliance" in haystack:
         terms.extend(["dishwasher installation", "appliance installation"])
     if "junk" in haystack or "hauling" in haystack:
         terms.extend(["junk removal", "hauling service"])
+    terms.append(title)
     if not terms:
         terms.append(job_type)
     seen: set[str] = set()
     queries: list[str] = []
     for term in terms:
-        query = f"{term} contractor {nearby}"
+        service_search = any(
+            service_term in term
+            for service_term in {
+                "appliance installation",
+                "dishwasher installation",
+                "gutter cleaning",
+                "hauling service",
+                "home theater installation",
+                "junk removal",
+                "tv mounting",
+            }
+        )
+        query = f"{term} {nearby}" if service_search else f"{term} contractor {nearby}"
         if query not in seen:
             seen.add(query)
             queries.append(query)
@@ -107,6 +123,14 @@ def _irrelevant_terms_for_job(job) -> set[str]:
         "hotel",
         "property management",
         "real estate",
+        "job seeker",
+        "job_seeker",
+        "hot jobs",
+        "hot_jobs",
+        "job posting",
+        "job openings",
+        "employment opportunity",
+        "to apply, contact the employer",
     }
     if "greenhouse" in haystack:
         irrelevant.update(
@@ -313,6 +337,7 @@ def _gemini_grounded_search(query: str) -> list[SearchResult]:
             "tools": [{"google_search": {}}],
             "generationConfig": {
                 "temperature": 0.2,
+                "maxOutputTokens": 2048,
             },
         }
     ).encode("utf-8")
@@ -372,11 +397,17 @@ def search_contractors(query: str) -> list[SearchResult]:
             results.extend(_gemini_grounded_search(query))
         except Exception:
             pass
-    brave_results = _brave_search(query)
+    try:
+        brave_results = _brave_search(query)
+    except Exception:
+        brave_results = []
     if brave_results:
         results.extend(brave_results)
     if not results:
-        results.extend(_duckduckgo_search(query))
+        try:
+            results.extend(_duckduckgo_search(query))
+        except Exception:
+            pass
     deduped: list[SearchResult] = []
     seen: set[str] = set()
     for result in results:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 
 def test_fastapi_app_imports() -> None:
     from app.main import app
@@ -14,6 +16,37 @@ def test_landing_page_is_public() -> None:
 
     assert "Stop chasing contractors." in response
     assert "Start a job" in response
+
+
+def test_sms_status_callback_updates_message_status(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "contractor.sqlite3"))
+
+    from app.config import get_settings
+    from app.db import connect, create_sms_message
+    from app.main import sms_status
+
+    get_settings.cache_clear()
+    create_sms_message(
+        direction="outbound",
+        from_number="+17163174413",
+        to_number="+17165550199",
+        body="Can you quote this?",
+        twilio_sid="SMtest",
+        status="queued",
+    )
+
+    class FakeRequest:
+        async def form(self):
+            return {"MessageSid": "SMtest", "MessageStatus": "undelivered", "ErrorCode": "30034"}
+
+    response = asyncio.run(sms_status(FakeRequest()))
+
+    with connect() as conn:
+        row = conn.execute("SELECT status, raw_payload_json FROM sms_messages WHERE twilio_sid = ?", ("SMtest",)).fetchone()
+    assert response == {"ok": "true"}
+    assert row["status"] == "undelivered"
+    assert "30034" in row["raw_payload_json"]
+    get_settings.cache_clear()
 
 
 def test_signup_creates_account_and_captures_project_context(monkeypatch, tmp_path) -> None:

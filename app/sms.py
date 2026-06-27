@@ -14,10 +14,12 @@ def send_sms(to_number: str, body: str) -> str:
         raise RuntimeError("Missing Twilio credentials")
 
     client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
+    status_callback = f"{settings.app_host.rstrip('/')}/greenhouse/sms/status"
     message = client.messages.create(
         to=to_number,
         from_=settings.twilio_from,
         body=body,
+        status_callback=status_callback,
     )
     create_sms_message(
         direction="outbound",

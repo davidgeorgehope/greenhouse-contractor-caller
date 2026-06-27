@@ -47,6 +47,7 @@ from .db import (
     update_call,
     update_job_brief,
     update_job_status,
+    update_sms_message_status,
     upsert_lead,
     outreach_for_job,
 )
@@ -1294,6 +1295,18 @@ async def sms(request: Request) -> Response:
         )
     append_event(None, "incoming_sms", payload)
     return Response("<Response></Response>", media_type="application/xml")
+
+
+@app.post("/greenhouse/sms/status")
+async def sms_status(request: Request) -> dict[str, str]:
+    form = await request.form()
+    payload = dict(form)
+    message_sid = str(payload.get("MessageSid", ""))
+    message_status = str(payload.get("MessageStatus") or payload.get("SmsStatus") or "")
+    if message_sid and message_status:
+        update_sms_message_status(message_sid, message_status, payload)
+    append_event(None, "twilio_sms_status", payload)
+    return {"ok": "true"}
 
 
 @app.post("/greenhouse/email")
