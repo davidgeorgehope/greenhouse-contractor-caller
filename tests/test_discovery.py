@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from app.config import get_settings
 from app.db import create_job, leads_for_job
-from app.discovery import SearchResult, discover_leads_for_job, discovery_queries, normalize_phone, result_fit_score, search_contractors
+from app.discovery import (
+    SearchResult,
+    _page_text,
+    discover_leads_for_job,
+    discovery_queries,
+    normalize_phone,
+    result_fit_score,
+    search_contractors,
+)
 
 
 def test_discovery_queries_follow_job_shape(tmp_path, monkeypatch) -> None:
@@ -104,6 +112,23 @@ def test_discover_leads_for_job_adds_review_leads(tmp_path, monkeypatch) -> None
     assert leads[0]["email"] == "quotes@example.com"
     assert leads[0]["status"] == "review"
     get_settings.cache_clear()
+
+
+def test_page_text_keeps_mailto_and_tel_links(monkeypatch) -> None:
+    def fake_open_url(url: str, *, headers=None, timeout: int = 12) -> str:
+        return """
+        <html>
+          <a href="mailto:quotes@example.com?subject=Job">Email us</a>
+          <a href="tel:+17165550199">Call</a>
+        </html>
+        """
+
+    monkeypatch.setattr("app.discovery._open_url", fake_open_url)
+
+    text = _page_text("https://example.com/contact")
+
+    assert "quotes@example.com" in text
+    assert "+17165550199" in text
 
 
 def test_greenhouse_discovery_rejects_adjacent_wrong_trade(tmp_path, monkeypatch) -> None:

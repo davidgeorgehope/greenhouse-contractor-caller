@@ -228,6 +228,39 @@ def test_lead_phone_uniqueness_is_job_scoped(tmp_path, monkeypatch) -> None:
     get_settings.cache_clear()
 
 
+def test_upsert_lead_does_not_blank_existing_email(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "test.sqlite3"))
+    get_settings.cache_clear()
+
+    job_id = create_job(title="Door one", job_type="door", description="", location="Buffalo", user_id=1)
+    upsert_lead(
+        job_id=job_id,
+        name="Door Contractor",
+        phone="+17165550199",
+        email="quotes@example.com",
+        category="contractor",
+        source_url="https://example.com",
+        notes="with email",
+        priority=50,
+    )
+    upsert_lead(
+        job_id=job_id,
+        name="Door Contractor Updated",
+        phone="+17165550199",
+        email="",
+        category="contractor",
+        source_url="https://example.com",
+        notes="without email",
+        priority=60,
+    )
+
+    leads = leads_for_job(job_id)
+
+    assert leads[0]["name"] == "Door Contractor Updated"
+    assert leads[0]["email"] == "quotes@example.com"
+    get_settings.cache_clear()
+
+
 def test_job_scoped_call_loop_can_include_manual_unknown_travel_leads(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
     get_settings.cache_clear()

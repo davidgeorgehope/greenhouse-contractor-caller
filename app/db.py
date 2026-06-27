@@ -762,7 +762,7 @@ def upsert_lead(
             ON CONFLICT(job_id, phone) DO UPDATE SET
               job_id=COALESCE(excluded.job_id, leads.job_id),
               name=excluded.name,
-              email=excluded.email,
+              email=CASE WHEN excluded.email != '' THEN excluded.email ELSE leads.email END,
               category=excluded.category,
               source_url=excluded.source_url,
               origin_address=excluded.origin_address,

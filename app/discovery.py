@@ -424,6 +424,16 @@ def _page_text(url: str) -> str:
         payload = _open_url(url, timeout=10)
     except Exception:
         return ""
+    payload = re.sub(
+        r"""(?is)<a\b([^>]*?)href=["']mailto:([^"'?>#]+)[^"']*["']([^>]*)>""",
+        lambda match: f"<a{match.group(1)}{match.group(3)}> {urllib.parse.unquote(match.group(2))} ",
+        payload,
+    )
+    payload = re.sub(
+        r"""(?is)<a\b([^>]*?)href=["']tel:([^"'?>#]+)[^"']*["']([^>]*)>""",
+        lambda match: f"<a{match.group(1)}{match.group(3)}> {urllib.parse.unquote(match.group(2))} ",
+        payload,
+    )
     payload = re.sub(r"(?is)<(script|style).*?</\1>", " ", payload)
     payload = re.sub(r"(?s)<[^>]+>", " ", payload)
     return html.unescape(re.sub(r"\s+", " ", payload))
