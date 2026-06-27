@@ -51,7 +51,7 @@ def test_execute_email_outreach(monkeypatch, tmp_path) -> None:
     get_settings.cache_clear()
 
 
-def test_cloudflare_only_email_config_blocks_cleanly(monkeypatch, tmp_path) -> None:
+def test_cloudflare_only_email_config_sends_via_cloudflare(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
     monkeypatch.setenv("CLOUDFLARE_EMAIL_TOKEN", "token")
@@ -62,15 +62,28 @@ def test_cloudflare_only_email_config_blocks_cleanly(monkeypatch, tmp_path) -> N
     monkeypatch.delenv("SMTP_FROM", raising=False)
     get_settings.cache_clear()
 
-    try:
-        send_email("quotes@example.com", "Subject: Door fitting\n\nCan you quote this?")
-    except RuntimeError as exc:
-        assert "No outbound email provider configured" in str(exc)
-        assert "Cloudflare Email Routing is inbound-only" in str(exc)
-    else:
-        raise AssertionError("Cloudflare-only email config should not attempt outbound delivery")
-    finally:
-        get_settings.cache_clear()
+    sent: list[tuple[str, str, str, str, str]] = []
+    monkeypatch.setattr(
+        "app.emailer._send_cloudflare",
+        lambda to_email, body, account_id, api_token, from_email: sent.append(
+            (to_email, body, account_id, api_token, from_email)
+        )
+        or "cloudflare:test",
+    )
+
+    receipt = send_email("quotes@example.com", "Subject: Door fitting\n\nCan you quote this?")
+
+    assert receipt == "cloudflare:test"
+    assert sent == [
+        (
+            "quotes@example.com",
+            "Subject: Door fitting\n\nCan you quote this?",
+            "account",
+            "token",
+            "Sam <contractors@example.com>",
+        )
+    ]
+    get_settings.cache_clear()
 
 
 def test_execute_text_outreach(monkeypatch, tmp_path) -> None:

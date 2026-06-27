@@ -24,18 +24,23 @@ def send_email(to_email: str, body: str) -> str:
     sender = (
         settings.resend_from
         if settings.resend_api_key and settings.resend_from
+        else settings.cloudflare_email_from
+        if settings.cloudflare_account_id and settings.cloudflare_email_token and settings.cloudflare_email_from
         else settings.smtp_from
     )
     subject, message_body = split_subject_body(body)
     if settings.resend_api_key and settings.resend_from:
         receipt = _send_resend(to_email, body, settings.resend_api_key, settings.resend_from)
+    elif settings.cloudflare_account_id and settings.cloudflare_email_token and settings.cloudflare_email_from:
+        receipt = _send_cloudflare(
+            to_email,
+            body,
+            settings.cloudflare_account_id,
+            settings.cloudflare_email_token,
+            settings.cloudflare_email_from,
+        )
     else:
         if not settings.smtp_host or not settings.smtp_from:
-            if settings.cloudflare_account_id or settings.cloudflare_email_token or settings.cloudflare_email_from:
-                raise RuntimeError(
-                    "No outbound email provider configured. Cloudflare Email Routing is inbound-only here; "
-                    "configure RESEND_API_KEY/RESEND_FROM or SMTP_* before sending email follow-ups."
-                )
             raise RuntimeError("Missing email sender settings")
 
         message = EmailMessage()
@@ -93,8 +98,12 @@ def _send_cloudflare(to_email: str, body: str, account_id: str, api_token: str, 
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        response_body = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Cloudflare email failed with HTTP {exc.code}: {detail[:500]}") from exc
     if not response_body.get("success"):
         raise RuntimeError(f"Cloudflare email failed: {response_body}")
     return str(response_body.get("result", {}).get("id") or f"cloudflare:{to_email}")
