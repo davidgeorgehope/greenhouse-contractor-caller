@@ -86,7 +86,7 @@ def test_cloudflare_only_email_config_sends_via_cloudflare(monkeypatch, tmp_path
     get_settings.cache_clear()
 
 
-def test_smtp_config_takes_precedence_over_cloudflare(monkeypatch, tmp_path) -> None:
+def test_cloudflare_config_takes_precedence_over_smtp(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "greenhouse.sqlite3"))
     monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
     monkeypatch.setenv("SMTP_FROM", "Sam <email.djhope@gmail.com>")
@@ -97,7 +97,7 @@ def test_smtp_config_takes_precedence_over_cloudflare(monkeypatch, tmp_path) -> 
     monkeypatch.delenv("RESEND_FROM", raising=False)
     get_settings.cache_clear()
 
-    cloudflare_calls: list[str] = []
+    cloudflare_calls: list[tuple[str, str, str, str, str]] = []
     smtp_messages: list[tuple[str, str, str]] = []
 
     class FakeSmtp:
@@ -122,14 +122,25 @@ def test_smtp_config_takes_precedence_over_cloudflare(monkeypatch, tmp_path) -> 
     monkeypatch.setattr("app.emailer.smtplib.SMTP", FakeSmtp)
     monkeypatch.setattr(
         "app.emailer._send_cloudflare",
-        lambda *args: cloudflare_calls.append("called") or "cloudflare:test",
+        lambda to_email, body, account_id, api_token, from_email: cloudflare_calls.append(
+            (to_email, body, account_id, api_token, from_email)
+        )
+        or "cloudflare:test",
     )
 
     receipt = send_email("quotes@example.com", "Subject: Door fitting\n\nCan you quote this?")
 
-    assert receipt == "smtp:quotes@example.com"
-    assert cloudflare_calls == []
-    assert smtp_messages[-1] == ("Sam <email.djhope@gmail.com>", "quotes@example.com", "Door fitting")
+    assert receipt == "cloudflare:test"
+    assert cloudflare_calls == [
+        (
+            "quotes@example.com",
+            "Subject: Door fitting\n\nCan you quote this?",
+            "account",
+            "token",
+            "Sam <contractors@example.com>",
+        )
+    ]
+    assert smtp_messages == []
     get_settings.cache_clear()
 
 
